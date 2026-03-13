@@ -111,6 +111,7 @@ fn allow_core_syscalls(ctx: &mut ScmpFilterContext) -> Result<()> {
         "alarm",
         "setitimer",
         "getpid",
+        "gettid",
         "getppid",
         "getpgrp",
         "getsid",
