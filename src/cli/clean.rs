@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::Path;
 
+use rand::distributions::Alphanumeric;
+use rand::{thread_rng, Rng};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -48,6 +50,22 @@ pub fn cmd_clean(project_root: &Path) -> Result<(), CleanError> {
     if sock_path.exists() {
         let _ = fs::remove_file(&sock_path);
     }
+
+    fs::create_dir_all(sandbox_dir.join("data").join("objects"))?;
+
+    // Generate random shm_name: "cas-" + 12 alphanumeric chars
+    let suffix: String = thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(12)
+        .map(char::from)
+        .collect();
+    let shm_name = format!("/cas-{}", suffix);
+
+    // Write metadata.bin and data.bin via init_sandbox
+    crate::syncing::disk::init_sandbox(&project_root.to_path_buf(), &shm_name)?;
+
+    // Create empty access.log (server expects it at .sandbox/data/access.log)
+    fs::write(sandbox_dir.join("data").join("access.log"), "")?;
 
     println!("Clean complete.");
     Ok(())

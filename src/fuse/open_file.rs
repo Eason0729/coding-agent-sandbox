@@ -282,4 +282,85 @@ impl OpenFile {
             }
         }
     }
+
+    pub fn copy_from(
+        &mut self,
+        offset_in: u64,
+        len: u64,
+        root: &Path,
+        daemon: &mut SyncClient,
+    ) -> Result<Vec<u8>, libc::c_int> {
+        match &mut self.state {
+            FileState::Passthrough { file } => {
+                if let Err(e) = file.seek(SeekFrom::Start(offset_in)) {
+                    return Err(e.raw_os_error().unwrap_or(libc::EIO));
+                }
+                let mut buf = vec![0u8; len as usize];
+                match file.read(&mut buf) {
+                    Ok(n) => Ok(buf[..n].to_vec()),
+                    Err(e) => Err(e.raw_os_error().unwrap_or(libc::EIO)),
+                }
+            }
+            FileState::CowDirty { tmp, .. }
+            | FileState::FuseOnlyDirty { tmp, .. }
+            | FileState::FuseOnlyNew { tmp } => {
+                let mut f = tmp_as_file(tmp);
+                if let Err(e) = f.seek(SeekFrom::Start(offset_in)) {
+                    return Err(e.raw_os_error().unwrap_or(libc::EIO));
+                }
+                let mut buf = vec![0u8; len as usize];
+                match f.read(&mut buf) {
+                    Ok(n) => Ok(buf[..n].to_vec()),
+                    Err(e) => Err(e.raw_os_error().unwrap_or(libc::EIO)),
+                }
+            }
+            FileState::CowClean { object_id } => {
+                let object_id = *object_id;
+                if let Some(id) = object_id {
+                    match daemon.get_object(id) {
+                        Ok(bytes) => {
+                            let start = offset_in as usize;
+                            let end = (offset_in as usize + len as usize).min(bytes.len());
+                            if start >= bytes.len() {
+                                Ok(vec![])
+                            } else {
+                                Ok(bytes[start..end].to_vec())
+                            }
+                        }
+                        Err(_) => Err(libc::EIO),
+                    }
+                } else {
+                    let real_path = root.join(self.path.strip_prefix("/").unwrap_or(&self.path));
+                    match File::open(&real_path) {
+                        Ok(mut f) => {
+                            if let Err(e) = f.seek(SeekFrom::Start(offset_in)) {
+                                return Err(e.raw_os_error().unwrap_or(libc::EIO));
+                            }
+                            let mut buf = vec![0u8; len as usize];
+                            match f.read(&mut buf) {
+                                Ok(n) => Ok(buf[..n].to_vec()),
+                                Err(e) => Err(e.raw_os_error().unwrap_or(libc::EIO)),
+                            }
+                        }
+                        Err(e) => Err(e.raw_os_error().unwrap_or(libc::EIO)),
+                    }
+                }
+            }
+            FileState::FuseOnlyClean { object_id } => {
+                let id = *object_id;
+                match daemon.get_object(id) {
+                    Ok(bytes) => {
+                        let start = offset_in as usize;
+                        let end = (offset_in as usize + len as usize).min(bytes.len());
+                        if start >= bytes.len() {
+                            Ok(vec![])
+                        } else {
+                            Ok(bytes[start..end].to_vec())
+                        }
+                    }
+                    Err(_) => Err(libc::EIO),
+                }
+            }
+        }
+    }
 }

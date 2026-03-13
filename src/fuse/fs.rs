@@ -9,10 +9,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    AccessFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, INodeNo, InitFlags,
-    KernelConfig, LockOwner, OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
-    WriteFlags,
+    AccessFlags, CopyFileRangeFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
+    INodeNo, InitFlags, KernelConfig, LockOwner, OpenFlags, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
+    Request, TimeOrNow, WriteFlags,
 };
 
 use crate::fuse::attr::{attr_from_daemon, attr_from_meta};
@@ -1307,6 +1307,68 @@ impl Filesystem for CasFuseFs {
         match res {
             Ok(n) => reply.written(n as u32),
             Err(code) => reply.error(errno(code)),
+        }
+    }
+
+    fn copy_file_range(
+        &self,
+        _req: &Request,
+        ino_in: INodeNo,
+        fh_in: FileHandle,
+        offset_in: u64,
+        ino_out: INodeNo,
+        fh_out: FileHandle,
+        offset_out: u64,
+        len: u64,
+        _flags: CopyFileRangeFlags,
+        reply: ReplyWrite,
+    ) {
+        let mut g = self.lock();
+
+        if g.path_of(ino_in).is_none() {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+        if g.path_of(ino_out).is_none() {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+
+        let mut of_in = match g.open_files.remove(&fh_in.0) {
+            Some(v) => v,
+            None => {
+                reply.error(Errno::EBADF);
+                return;
+            }
+        };
+
+        let mut of_out = match g.open_files.remove(&fh_out.0) {
+            Some(v) => v,
+            None => {
+                g.open_files.insert(fh_in.0, of_in);
+                reply.error(Errno::EBADF);
+                return;
+            }
+        };
+
+        let root = g.root.clone();
+        let read_result = of_in.copy_from(offset_in, len, &root, &mut g.daemon);
+
+        match read_result {
+            Ok(data) => {
+                let write_result = of_out.write_at(offset_out, &data, &root, &mut g.daemon);
+                g.open_files.insert(fh_in.0, of_in);
+                g.open_files.insert(fh_out.0, of_out);
+                match write_result {
+                    Ok(n) => reply.written(n as u32),
+                    Err(code) => reply.error(errno(code)),
+                }
+            }
+            Err(code) => {
+                g.open_files.insert(fh_in.0, of_in);
+                g.open_files.insert(fh_out.0, of_out);
+                reply.error(errno(code));
+            }
         }
     }
 

@@ -22,8 +22,6 @@ In the case of impossible plan, try to:
 
 Additionally, if low-level program bugs/inability is encountered, consult to man page.
 
-**Human/User are professional software engineers, also consult user for lack of low-level understanding to system**
-
 ## Rust Coding guideline
 
 1. Always unit test if possible
