@@ -1,0 +1,160 @@
+use std::path::{Path, PathBuf};
+
+use globset::{Error as GlobError, Glob, GlobSet, GlobSetBuilder};
+
+use crate::config::config::Config;
+use crate::fuse::policy::{AccessMode, Policy};
+
+/// Concrete [`Policy`] implementation driven by a parsed [`Config`].
+///
+/// Glob patterns from the config are matched against **paths relative to the
+/// project root**.  When [`classify`] / [`should_log`] receive an absolute
+/// path (as stored in the inode table), the project root prefix is stripped
+/// first.  If the path does not start with the root the original path is used
+/// as-is so that FUSE-virtual paths (e.g. `/src/main.rs`) are still handled
+/// sensibly.
+///
+/// ## Evaluation order
+///
+/// 1. Blacklist → [`AccessMode::FuseOnly`], no log.
+/// 2. Whitelist → [`AccessMode::Passthrough`], no log.
+/// 3. `disableLog` → [`AccessMode::CopyOnWrite`], no log.
+/// 4. Default → [`AccessMode::CopyOnWrite`], logged.
+pub struct ConfigPolicy {
+    /// Absolute path of the project root (used for prefix-stripping).
+    root: PathBuf,
+
+    /// Compiled blacklist glob set.
+    blacklist: GlobSet,
+    /// Compiled whitelist glob set.
+    whitelist: GlobSet,
+    /// Compiled disableLog glob set.
+    disable_log: GlobSet,
+
+    /// Whether the project root directory itself is implicitly whitelisted.
+    /// Set to `false` only when the user explicitly blacklisted it.
+    root_is_whitelisted: bool,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn build_globset(patterns: &[String]) -> Result<GlobSet, GlobError> {
+    let mut builder = GlobSetBuilder::new();
+    for pat in patterns {
+        builder.add(Glob::new(pat)?);
+    }
+    builder.build()
+}
+
+fn build_globset_builder(patterns: &[String]) -> Result<GlobSetBuilder, GlobError> {
+    let mut builder = GlobSetBuilder::new();
+    for pat in patterns {
+        builder.add(Glob::new(pat)?);
+    }
+    Ok(builder)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ConfigPolicy
+// ─────────────────────────────────────────────────────────────────────────────
+
+impl ConfigPolicy {
+    /// Build a `ConfigPolicy` from a parsed `Config` and the project root.
+    ///
+    /// Applies implicit rules:
+    /// * `.sandbox/**` is added to the blacklist unless `.sandbox` already
+    ///   matches the user-provided whitelist.
+    /// * The project root itself (relative path `""`) is treated as passthrough
+    ///   unless it matches the user-provided blacklist.
+    pub fn from_config(config: &Config, root: &Path) -> Result<Self, GlobError> {
+        // Build user-only sets for implicit-rule checks (no implicit rules yet).
+        let user_whitelist = build_globset(&config.whitelist)?;
+        let user_blacklist = build_globset(&config.blacklist)?;
+
+        // Now build the final sets, starting from the user patterns.
+        let mut bl_builder = build_globset_builder(&config.blacklist)?;
+        let wl_builder = build_globset_builder(&config.whitelist)?;
+        let dl_builder = build_globset_builder(&config.disable_log)?;
+
+        // Implicit: .sandbox → blacklist (unless user whitelisted it).
+        if !user_whitelist.is_match(".sandbox") {
+            bl_builder.add(Glob::new(".sandbox")?);
+            bl_builder.add(Glob::new(".sandbox/**")?);
+        }
+
+        // Implicit: pwd → whitelist flag (unless user blacklisted it).
+        // We represent this as a boolean rather than a glob because matching
+        // an empty/dot path with globset is unreliable.
+        let root_is_whitelisted = !user_blacklist.is_match(".") && !user_blacklist.is_match("");
+
+        Ok(ConfigPolicy {
+            root: root.to_path_buf(),
+            blacklist: bl_builder.build()?,
+            whitelist: wl_builder.build()?,
+            disable_log: dl_builder.build()?,
+            root_is_whitelisted,
+        })
+    }
+
+    /// Strip the project-root prefix from `path`, returning the relative
+    /// sub-path.  Falls back to `path` itself when the prefix is absent (e.g.
+    /// absolute paths outside the project root like `/bin/bash`).  The result
+    /// is non-absolute iff the path lives under the project root.
+    fn rel<'a>(&self, path: &'a Path) -> &'a Path {
+        path.strip_prefix(&self.root).unwrap_or(path)
+    }
+}
+
+impl Policy for ConfigPolicy {
+    fn classify(&self, path: &Path) -> AccessMode {
+        let rel = self.rel(path);
+
+        // A non-absolute relative path means strip_prefix succeeded → path is
+        // under (or equal to) the project root.
+        let under_root = !rel.is_absolute();
+
+        // Blacklist first (applies everywhere, including inside project root).
+        if self.blacklist.is_match(rel) {
+            return AccessMode::FuseOnly;
+        }
+
+        // Explicit user whitelist.
+        if self.whitelist.is_match(rel) {
+            return AccessMode::Passthrough;
+        }
+
+        // Implicit: the entire project root tree is passthrough unless the user
+        // explicitly blacklisted it.
+        if under_root && self.root_is_whitelisted {
+            return AccessMode::Passthrough;
+        }
+
+        AccessMode::CopyOnWrite
+    }
+
+    fn should_log(&self, path: &Path) -> bool {
+        let rel = self.rel(path);
+        let under_root = !rel.is_absolute();
+
+        // Never log blacklisted paths (FuseOnly).
+        if self.blacklist.is_match(rel) {
+            return false;
+        }
+        // Never log explicit whitelist (Passthrough).
+        if self.whitelist.is_match(rel) {
+            return false;
+        }
+        // Never log implicit project-root passthrough.
+        if under_root && self.root_is_whitelisted {
+            return false;
+        }
+        // Never log paths where logging is explicitly disabled.
+        if self.disable_log.is_match(rel) {
+            return false;
+        }
+        // Remaining paths are CopyOnWrite outside the project root → log them.
+        true
+    }
+}

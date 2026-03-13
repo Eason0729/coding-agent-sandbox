@@ -1,0 +1,253 @@
+use libseccomp::ScmpAction;
+use libseccomp::ScmpArch;
+use libseccomp::ScmpFilterContext;
+use libseccomp::ScmpSyscall;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum SeccompError {
+    #[error("failed to initialize seccomp context: {0}")]
+    Init(String),
+    #[error("failed to add syscall rule: {0}")]
+    AddSyscall(String),
+    #[error("failed to load seccomp filter: {0}")]
+    Load(String),
+}
+
+pub type Result<T> = std::result::Result<T, SeccompError>;
+
+pub fn apply_seccomp_filter() -> Result<()> {
+    let mut ctx = ScmpFilterContext::new(ScmpAction::KillProcess)
+        .map_err(|e| SeccompError::Init(e.to_string()))?;
+
+    allow_core_syscalls(&mut ctx)?;
+
+    ctx.load().map_err(|e| SeccompError::Load(e.to_string()))?;
+
+    Ok(())
+}
+
+fn allow_core_syscalls(ctx: &mut ScmpFilterContext) -> Result<()> {
+    let syscalls = [
+        "read",
+        "write",
+        "writev",
+        "pread64",
+        "pwrite64",
+        "open",
+        "openat",
+        "close",
+        "stat",
+        "lstat",
+        "fstat",
+        "access",
+        "faccessat",
+        "readlink",
+        "readlinkat",
+        "getcwd",
+        "getdents64",
+        "mkdir",
+        "rmdir",
+        "unlink",
+        "link",
+        "symlink",
+        "rename",
+        "chmod",
+        "fchmod",
+        "chown",
+        "fchown",
+        "lchown",
+        "mount",
+        "umount",
+        "umount2",
+        "truncate",
+        "ftruncate",
+        "mmap",
+        "mprotect",
+        "munmap",
+        "mremap",
+        "msync",
+        "brk",
+        "madvise",
+        "dup",
+        "dup2",
+        "dup3",
+        "pipe",
+        "pipe2",
+        "select",
+        "poll",
+        "epoll_create",
+        "epoll_create1",
+        "epoll_ctl",
+        "epoll_wait",
+        "epoll_pwait",
+        "epoll_pwait2",
+        "pselect6",
+        "ppoll",
+        "rt_sigaction",
+        "rt_sigprocmask",
+        "rt_sigreturn",
+        "sigaltstack",
+        "kill",
+        "getsockopt",
+        "setsockopt",
+        "getpeername",
+        "getsockname",
+        "socket",
+        "socketpair",
+        "bind",
+        "listen",
+        "accept",
+        "connect",
+        "shmget",
+        "shmat",
+        "shmctl",
+        "clock_gettime",
+        "clock_getres",
+        "clock_nanosleep",
+        "gettimeofday",
+        "time",
+        "nanosleep",
+        "alarm",
+        "setitimer",
+        "getpid",
+        "getppid",
+        "getpgrp",
+        "getsid",
+        "getuid",
+        "getgid",
+        "geteuid",
+        "getegid",
+        "setuid",
+        "setgid",
+        "seteuid",
+        "setegid",
+        "setreuid",
+        "setregid",
+        "getgroups",
+        "setgroups",
+        "getresuid",
+        "getresgid",
+        "setresuid",
+        "setresgid",
+        "getpgid",
+        "setpgid",
+        "setsid",
+        "setns",
+        "uname",
+        "sysinfo",
+        "syslog",
+        "getrlimit",
+        "setrlimit",
+        "getrusage",
+        "umask",
+        "prctl",
+        "prlimit64",
+        "getrandom",
+        "execve",
+        "exit",
+        "exit_group",
+        "wait4",
+        "waitid",
+        "personality",
+        "arch_prctl",
+        "recvfrom",
+        "sendto",
+        "recvmsg",
+        "sendmsg",
+        // glibc startup / threading
+        "set_tid_address",
+        "set_robust_list",
+        "rseq",
+        "futex",
+        "futex_waitv",
+        "clone",
+        "clone3",
+        "tgkill",
+        "tkill",
+        // common I/O
+        "ioctl",
+        "lseek",
+        "sendfile",
+        "copy_file_range",
+        "fcntl",
+        "fadvise64",
+        "sync",
+        "fsync",
+        "fdatasync",
+        "syncfs",
+        // file ops
+        "newfstatat",
+        "statx",
+        "openat2",
+        "mkdirat",
+        "unlinkat",
+        "renameat",
+        "renameat2",
+        "linkat",
+        "symlinkat",
+        "fchmodat",
+        "fchownat",
+        "faccessat2",
+        "getdents",
+        "inotify_init1",
+        "inotify_add_watch",
+        "eventfd2",
+        "timerfd_create",
+        "timerfd_settime",
+        "timerfd_gettime",
+        "signalfd4",
+        "accept4",
+        "recvmmsg",
+        "sendmmsg",
+        // terminal / interactive shell
+        "setfsuid",
+        "setfsgid",
+        "sched_getaffinity",
+        "sched_setaffinity",
+        "capget",
+        "capset",
+        "chdir",
+        "fchdir",
+        "chroot",
+        "pivot_root",
+        "statfs",
+        "fstatfs",
+        "getxattr",
+        "lgetxattr",
+        "fgetxattr",
+        "listxattr",
+        "llistxattr",
+        "flistxattr",
+        "memfd_create",
+        "memfd_secret",
+        "mlock",
+        "mlock2",
+        "munlock",
+        "mlockall",
+        "munlockall",
+        "splice",
+        "tee",
+        "vmsplice",
+        // time-related
+        "utimensat",
+        "utimes",
+        "utime",
+        "clock_settime",
+        "settimeofday",
+    ];
+
+    for name in syscalls.iter() {
+        add_syscall_allow(ctx, name)?;
+    }
+
+    Ok(())
+}
+
+fn add_syscall_allow(ctx: &mut ScmpFilterContext, name: &str) -> Result<()> {
+    if let Ok(syscall) = ScmpSyscall::from_name(name) {
+        ctx.add_rule(ScmpAction::Allow, syscall)
+            .map_err(|e| SeccompError::AddSyscall(e.to_string()))?;
+    }
+    Ok(())
+}
