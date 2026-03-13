@@ -11,13 +11,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use fuser::{
     AccessFlags, CopyFileRangeFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
     INodeNo, InitFlags, KernelConfig, LockOwner, OpenFlags, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
-    Request, TimeOrNow, WriteFlags,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite,
+    ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 
 use crate::fuse::attr::{attr_from_daemon, attr_from_meta};
 use crate::fuse::inode::InodeTable;
-use crate::fuse::open_file::{FileState, OpenFile, TTL};
+use crate::fuse::open_file::{tmp_as_file, FileState, OpenFile, TTL};
 use crate::fuse::policy::{AccessMode, Policy};
 use crate::syncing::client::SyncClient;
 use crate::syncing::proto::{EntryType, FileMetadata, FuseEntry};
@@ -1448,6 +1448,135 @@ impl Filesystem for CasFuseFs {
         match res {
             Ok(()) => reply.ok(),
             Err(code) => reply.error(errno(code)),
+        }
+    }
+
+    fn lseek(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: i64,
+        whence: i32,
+        reply: ReplyLseek,
+    ) {
+        use std::io::{Seek, SeekFrom};
+
+        let mut g = self.lock();
+        if g.path_of(ino).is_none() {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+
+        let mut of = match g.open_files.remove(&fh.0) {
+            Some(v) => v,
+            None => {
+                reply.error(Errno::EBADF);
+                return;
+            }
+        };
+
+        let root = g.root.clone();
+        let result: Result<u64, std::io::Error> = match &mut of.state {
+            FileState::Passthrough { file } => {
+                let seek_from = match whence {
+                    0 => SeekFrom::Start(offset as u64),
+                    1 => SeekFrom::Current(offset),
+                    2 => SeekFrom::End(offset),
+                    _ => {
+                        g.open_files.insert(fh.0, of);
+                        reply.error(Errno::EINVAL);
+                        return;
+                    }
+                };
+                file.seek(seek_from).map(|pos| pos as u64)
+            }
+            FileState::CowDirty { tmp, .. }
+            | FileState::FuseOnlyDirty { tmp, .. }
+            | FileState::FuseOnlyNew { tmp } => {
+                let mut f = tmp_as_file(tmp);
+                let seek_from = match whence {
+                    0 => SeekFrom::Start(offset as u64),
+                    1 => SeekFrom::Current(offset),
+                    2 => SeekFrom::End(offset),
+                    _ => {
+                        g.open_files.insert(fh.0, of);
+                        reply.error(Errno::EINVAL);
+                        return;
+                    }
+                };
+                f.seek(seek_from).map(|pos| pos as u64)
+            }
+            FileState::CowClean { object_id } => {
+                let size = if let Some(id) = object_id {
+                    match g.daemon.get_object(*id) {
+                        Ok(bytes) => bytes.len() as u64,
+                        Err(_) => {
+                            g.open_files.insert(fh.0, of);
+                            reply.error(Errno::EIO);
+                            return;
+                        }
+                    }
+                } else {
+                    let real_path = root.join(of.path.strip_prefix("/").unwrap_or(&of.path));
+                    match std::fs::metadata(&real_path) {
+                        Ok(meta) => meta.len(),
+                        Err(_) => {
+                            g.open_files.insert(fh.0, of);
+                            reply.error(Errno::EIO);
+                            return;
+                        }
+                    }
+                };
+                let new_pos = match whence {
+                    0 => offset as u64,
+                    1 => {
+                        g.open_files.insert(fh.0, of);
+                        reply.error(Errno::EPERM);
+                        return;
+                    }
+                    2 => (size as i64).saturating_add(offset) as u64,
+                    _ => {
+                        g.open_files.insert(fh.0, of);
+                        reply.error(Errno::EINVAL);
+                        return;
+                    }
+                };
+                Ok(new_pos)
+            }
+            FileState::FuseOnlyClean { object_id } => {
+                let id = *object_id;
+                let size = match g.daemon.get_object(id) {
+                    Ok(bytes) => bytes.len() as u64,
+                    Err(_) => {
+                        g.open_files.insert(fh.0, of);
+                        reply.error(Errno::EIO);
+                        return;
+                    }
+                };
+                let new_pos = match whence {
+                    0 => offset as u64,
+                    1 => {
+                        g.open_files.insert(fh.0, of);
+                        reply.error(Errno::EPERM);
+                        return;
+                    }
+                    2 => (size as i64).saturating_add(offset) as u64,
+                    _ => {
+                        g.open_files.insert(fh.0, of);
+                        reply.error(Errno::EINVAL);
+                        return;
+                    }
+                };
+                Ok(new_pos)
+            }
+        };
+
+        g.open_files.insert(fh.0, of);
+
+        match result {
+            Ok(pos) => reply.offset(pos as i64),
+            Err(e) => reply.error(errno(e.raw_os_error().unwrap_or(libc::EIO))),
         }
     }
 

@@ -182,4 +182,6 @@ impl SyncClient {
             _ => Err(ClientError::Server("Unexpected response".to_string())),
         }
     }
+
+    // FIXME: we need partial update for speed
 }
