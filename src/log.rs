@@ -2,6 +2,7 @@ pub use log::LevelFilter;
 
 use crate::config::Config;
 use env_logger::Target;
+use std::io::Write;
 use std::path::PathBuf;
 
 #[cfg(feature = "debug")]
@@ -19,6 +20,7 @@ pub fn init_logger(_level: LevelFilter) {
         .filter_module("fuser", LevelFilter::Info)
         .filter_level(LevelFilter::Debug)
         .target(Target::Pipe(Box::new(file)))
+        .format(|buf, record| writeln!(buf, "{}: {}", record.level(), record.args()))
         .init();
 }
 
@@ -28,6 +30,7 @@ pub fn init_logger(level: LevelFilter) {
         .filter_module("fuser", LevelFilter::Info)
         .filter_level(level)
         .target(Target::Stderr)
+        .format(|buf, record| writeln!(buf, "{}: {}", record.level(), record.args()))
         .init();
 }
 

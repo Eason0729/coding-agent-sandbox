@@ -13,9 +13,15 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "cas",
-    about = "Coding Agent Sandbox — filesystem isolation tool"
+    about = "Coding Agent Sandbox — filesystem isolation tool",
+    disable_help_subcommand = true,
+    allow_hyphen_values = true
 )]
 struct Cli {
+    /// Project root directory (defaults to current directory)
+    #[arg(short, long, default_value = ".")]
+    root: PathBuf,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -23,68 +29,48 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Initialize a new sandbox in the current directory
-    Init {
-        /// Project root directory (defaults to current directory)
-        #[arg(default_value = ".")]
-        path: PathBuf,
-    },
-
+    Init,
+    /// Remove FUSE data and reset SHM
+    Clean,
+    /// Delete entire .sandbox directory
+    Purge,
     /// Run a command inside the sandbox
+    #[command(name = "run")]
     Run {
-        /// Project root directory (defaults to current directory)
-        #[arg(long, default_value = ".")]
-        root: PathBuf,
-
         /// The command and arguments to run
-        #[arg(trailing_var_arg = true, required = true)]
+        #[arg(trailing_var_arg = true)]
         command: Vec<String>,
     },
-
-    /// Remove FUSE data and reset SHM
-    Clean {
-        /// Project root directory (defaults to current directory)
-        #[arg(default_value = ".")]
-        path: PathBuf,
-    },
-}
-
-impl Commands {
-    fn get_path(&self) -> PathBuf {
-        let path = match self {
-            Commands::Init { path } => path,
-            Commands::Run { root, .. } => root,
-            Commands::Clean { path } => path,
-        }
-        .to_path_buf();
-
-        path.canonicalize().unwrap_or(path)
-    }
 }
 
 fn main() {
     let cli = Cli::parse();
 
-    inner_log::init_logger(inner_log::log_level_from_config(&cli.command.get_path()));
+    let root = cli.root.canonicalize().unwrap_or(cli.root.clone());
+    inner_log::init_logger(inner_log::log_level_from_config(&root));
 
     match cli.command {
-        Commands::Init { path } => {
-            let root = path.canonicalize().unwrap_or(path);
+        Commands::Init => {
             if let Err(e) = cli::cmd_init(&root) {
-                ::log::error!("cas init: {}", e);
+                log::error!("cas init: {}", e);
                 std::process::exit(1);
             }
         }
-        Commands::Run { root, command } => {
-            let root = root.canonicalize().unwrap_or(root);
-            if let Err(e) = cli::cmd_run(&root, &command) {
-                ::log::error!("cas run: {}", e);
-                std::process::exit(1);
-            }
-        }
-        Commands::Clean { path } => {
-            let root = path.canonicalize().unwrap_or(path);
+        Commands::Clean => {
             if let Err(e) = cli::cmd_clean(&root) {
-                ::log::error!("cas clean: {}", e);
+                log::error!("cas clean: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Purge => {
+            if let Err(e) = cli::cmd_purge(&root) {
+                log::error!("cas purge: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Run { command } => {
+            if let Err(e) = cli::cmd_run(&root, &command) {
+                log::error!("cas run: {}", e);
                 std::process::exit(1);
             }
         }

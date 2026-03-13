@@ -302,121 +302,6 @@ impl Filesystem for CasFuseFs {
         Ok(())
     }
 
-    fn mknod(
-        &self,
-        req: &Request,
-        parent: INodeNo,
-        name: &OsStr,
-        mode: u32,
-        _umask: u32,
-        _rdev: u32,
-        reply: ReplyEntry,
-    ) {
-        self.req_start(
-            req,
-            "mknod",
-            None,
-            &format!(
-                "parent={} name={} mode={:o}",
-                parent.0,
-                name.to_string_lossy(),
-                mode
-            ),
-        );
-        let mut g = self.lock();
-        let parent_path = match g.path_of(parent).map(Path::to_path_buf) {
-            Some(p) => p,
-            None => {
-                self.req_err(req, "mknod", None, libc::ENOENT, "parent inode missing");
-                reply.error(Errno::ENOENT);
-                return;
-            }
-        };
-
-        let path = normalize_abs(&parent_path.join(name));
-        self.maybe_log(req, &mut g, &path, "mknod");
-
-        let file_type = mode & libc::S_IFMT;
-        if file_type != libc::S_IFREG && file_type != 0 {
-            self.req_err(
-                req,
-                "mknod",
-                Some(&path),
-                libc::EPERM,
-                "non-regular mknod rejected",
-            );
-            reply.error(Errno::EPERM);
-            return;
-        }
-
-        let access = self.policy.classify(&path);
-        match access {
-            AccessMode::Passthrough => {
-                let real = g.real_path(&path);
-                let mut opts = OpenOptions::new();
-                opts.create(true).write(true).mode(mode & 0o7777);
-                match opts.open(&real) {
-                    Ok(_) => {
-                        let ino = g.inodes.get_or_insert(&path);
-                        match fs::symlink_metadata(&real) {
-                            Ok(meta) => {
-                                self.req_ok(req, "mknod", Some(&path), "created in passthrough");
-                                reply.entry(&TTL, &attr_from_meta(ino, &meta), fuser::Generation(0))
-                            }
-                            Err(e) => {
-                                let code = io_errno(&e);
-                                self.req_err(
-                                    req,
-                                    "mknod",
-                                    Some(&path),
-                                    code,
-                                    "stat created file failed",
-                                );
-                                reply.error(errno(code));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let code = io_errno(&e);
-                        self.req_err(req, "mknod", Some(&path), code, "open create failed");
-                        reply.error(errno(code));
-                    }
-                }
-            }
-            AccessMode::FuseOnly | AccessMode::CopyOnWrite => {
-                let full_mode = libc::S_IFREG | (mode & 0o7777);
-                let meta = file_meta_with_now(0, full_mode, req.uid(), req.gid());
-                if g.daemon.put_file(path.clone(), Vec::new(), meta).is_err() {
-                    self.req_err(
-                        req,
-                        "mknod",
-                        Some(&path),
-                        libc::EIO,
-                        "daemon put_file failed",
-                    );
-                    reply.error(Errno::EIO);
-                    return;
-                }
-                match g.stat_path(&path, &access) {
-                    Ok((_k, attr)) => {
-                        self.req_ok(req, "mknod", Some(&path), "created in daemon");
-                        reply.entry(&TTL, &attr, fuser::Generation(0))
-                    }
-                    Err(code) => {
-                        self.req_err(
-                            req,
-                            "mknod",
-                            Some(&path),
-                            code,
-                            "stat after daemon create failed",
-                        );
-                        reply.error(errno(code));
-                    }
-                }
-            }
-        }
-    }
-
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         self.req_start(
             req,
@@ -1669,6 +1554,22 @@ impl Filesystem for CasFuseFs {
     }
 
     fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
+        reply.error(Errno::ENOTSUP);
+    }
+
+    fn ioctl(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _flags: fuser::IoctlFlags,
+        _cmd: u32,
+        _in_data: &[u8],
+        _out_size: u32,
+        reply: fuser::ReplyIoctl,
+    ) {
+        // tcl use it: /usr/bin/tclsh9.0
+
         reply.error(Errno::ENOTSUP);
     }
 }

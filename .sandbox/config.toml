@@ -1,4 +1,4 @@
 whitelist = []
 blacklist = []
 disableLog = []
-logLevel = "trace"
+logLevel = "info"
