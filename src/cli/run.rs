@@ -1,9 +1,12 @@
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use log;
 use nix::sys::wait::waitpid;
+use nix::sys::wait::WaitPidFlag;
 use nix::sys::wait::WaitStatus;
 use nix::unistd::{fork, ForkResult};
 use thiserror::Error;
@@ -12,7 +15,8 @@ use crate::config::{Config, ConfigPolicy};
 use crate::isolate::seccomp::apply_seccomp_filter;
 use crate::isolate::stage1::create_user_ns;
 use crate::isolate::stage2::{create_mount_ns, drop_capabilities, prepare_chroot};
-use crate::shm::{adopt_mutex_after_fork, ShmState};
+use crate::shm::ShmState;
+use crate::syncing::server::PollLock;
 use crate::syncing::SyncClient;
 
 pub type Result<T> = std::result::Result<T, RunError>;
@@ -41,13 +45,17 @@ pub enum RunError {
     Seccomp(#[from] crate::isolate::seccomp::SeccompError),
     #[error("command is required")]
     NoCommand,
+    #[error("syncing daemon not ready: {0}")]
+    DaemonNotReady(String),
+    #[error("FUSE mount failed: {0}")]
+    FuseMountFailed(String),
 }
 
 /// Poll the mountpoint until a different filesystem is mounted there (i.e.
 /// the FUSE daemon has completed its mount).  We detect this by comparing
 /// the device number of the mountpoint against its parent: once FUSE mounts,
 /// the kernel assigns a new device number to the mountpoint.
-fn wait_for_fuse_ready(mountpoint: &Path) {
+fn wait_for_fuse_ready(mountpoint: &Path, fuse_child: nix::unistd::Pid) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let parent_dev = mountpoint
         .parent()
@@ -55,13 +63,128 @@ fn wait_for_fuse_ready(mountpoint: &Path) {
         .map(|m| m.dev())
         .unwrap_or(u64::MAX);
 
+    let deadline = Instant::now() + Duration::from_secs(10);
+
     loop {
         if let Ok(meta) = std::fs::metadata(mountpoint) {
             if meta.dev() != parent_dev {
-                break;
+                return Ok(());
             }
         }
+
+        match waitpid(fuse_child, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => {}
+            Ok(WaitStatus::Exited(_, code)) => {
+                return Err(RunError::FuseMountFailed(format!(
+                    "fuse daemon exited before mount with code {code}"
+                )));
+            }
+            Ok(WaitStatus::Signaled(_, sig, _)) => {
+                return Err(RunError::FuseMountFailed(format!(
+                    "fuse daemon was killed by signal {sig}"
+                )));
+            }
+            Ok(_) => {
+                return Err(RunError::FuseMountFailed(
+                    "fuse daemon terminated before mount".to_string(),
+                ));
+            }
+            Err(e) => {
+                return Err(RunError::FuseMountFailed(format!(
+                    "failed to wait fuse daemon: {e}"
+                )));
+            }
+        }
+
+        if Instant::now() > deadline {
+            return Err(RunError::FuseMountFailed(
+                "timeout waiting for FUSE mount".to_string(),
+            ));
+        }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_daemon_ready(shm: &ShmState, daemon_socket: &Path, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let socket_ready = {
+            let guard = unsafe { shm.lock() };
+            guard.is_socket_ready()
+        };
+
+        if socket_ready && UnixStream::connect(daemon_socket).is_ok() {
+            return Ok(());
+        }
+
+        if Instant::now() > deadline {
+            return Err(RunError::DaemonNotReady(format!(
+                "socket not accepting connections at {}",
+                daemon_socket.display()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+struct RunningCountGuard<'a> {
+    shm: &'a ShmState,
+    armed: bool,
+}
+
+impl<'a> RunningCountGuard<'a> {
+    fn new(shm: &'a ShmState) -> Self {
+        Self { shm, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RunningCountGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut guard = unsafe { self.shm.lock() };
+        guard.decrement();
+    }
+}
+
+struct ShmPollLock<'a> {
+    shm: &'a ShmState,
+    last_check: Instant,
+}
+
+impl<'a> ShmPollLock<'a> {
+    fn new(shm: &'a ShmState) -> Self {
+        Self {
+            shm,
+            last_check: Instant::now(),
+        }
+    }
+}
+
+impl PollLock for ShmPollLock<'_> {
+    fn poll_shutdown<F>(&mut self, on_shutdown: F) -> bool
+    where
+        F: FnOnce(),
+    {
+        if self.last_check.elapsed() < Duration::from_secs(1) {
+            return false;
+        }
+
+        let mut guard = unsafe { self.shm.lock() };
+        if guard.get_running_count() != 0 {
+            drop(guard);
+            self.last_check = Instant::now();
+            return false;
+        }
+
+        guard.set_socket_ready(false);
+        on_shutdown();
+        true
     }
 }
 
@@ -91,54 +214,25 @@ pub fn cmd_run(project_root: &Path, cmd_args: &[String]) -> Result<()> {
         Err(_) => ShmState::create(&meta.shm_name)?,
     };
 
-    // 4. Increment running_count atomically
-    let count_before = shm.increment_running_count();
-
     let daemon_socket = sandbox_dir.join("daemon.sock");
 
-    // 5. If running_count was 0 before increment: fork the syncing daemon
-    if count_before == 0 {
-        match unsafe { fork() } {
-            Ok(ForkResult::Child) => {
-                // Syncing daemon process
-                // Reinitialize pthread mutex after fork
-                let mut shm_child = match ShmState::open(&meta.shm_name) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        log::error!("Syncing daemon: failed to open SHM");
-                        std::process::exit(1);
-                    }
-                };
-                unsafe {
-                    if let Err(e) = adopt_mutex_after_fork(shm_child.state_mut()) {
-                        log::error!("Syncing daemon: failed to adopt mutex: {}", e);
-                        std::process::exit(1);
-                    }
-                }
+    let mut guard = unsafe { shm.lock() };
+    let was_running = guard.increment();
 
-                crate::syncing::server::run(project_root.to_path_buf(), shm_child);
-                std::process::exit(0);
-            }
-            Ok(ForkResult::Parent { .. }) => {
-                // Parent: wait for daemon socket to be ready
-                loop {
-                    if shm.socket_ready() {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            }
-            Err(e) => return Err(RunError::Fork(e)),
-        }
+    let mut running_guard = RunningCountGuard::new(&shm);
+
+    if was_running == 0 {
+        guard.set_socket_ready(false);
+        let poll_lock = ShmPollLock::new(&shm);
+        crate::syncing::server::fork_and_run(project_root.to_path_buf(), poll_lock, move || {
+            drop(guard)
+        })
+        .map_err(RunError::Fork)?;
     } else {
-        // Daemon already running; wait for socket if not yet ready
-        loop {
-            if shm.socket_ready() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        drop(guard);
     }
+
+    wait_for_daemon_ready(&shm, &daemon_socket, Duration::from_secs(15))?;
 
     // 6. Create a temporary rootfs and mountpoint
     let rootfs = tempfile::tempdir()?;
@@ -192,9 +286,12 @@ pub fn cmd_run(project_root: &Path, cmd_args: &[String]) -> Result<()> {
                     }
                     std::process::exit(0);
                 }
-                Ok(ForkResult::Parent { child: _fuse_child }) => {
+                Ok(ForkResult::Parent { child: fuse_child }) => {
                     // setup(2): wait for FUSE to be ready, then chroot + exec
-                    wait_for_fuse_ready(&mountpoint_path);
+                    if let Err(e) = wait_for_fuse_ready(&mountpoint_path, fuse_child) {
+                        log::error!("setup(2): wait_for_fuse_ready failed: {}", e);
+                        std::process::exit(1);
+                    }
 
                     if let Err(e) = prepare_chroot(&rootfs_path, &mountpoint_path, &cwd) {
                         log::error!("setup(2): prepare_chroot failed: {}", e);
@@ -247,7 +344,11 @@ pub fn cmd_run(project_root: &Path, cmd_args: &[String]) -> Result<()> {
     };
 
     // 8. Decrement running_count
-    shm.decrement_running_count();
+    running_guard.disarm();
+    {
+        let mut guard = unsafe { shm.lock() };
+        guard.decrement();
+    }
 
     // Drop tempdir handles (unmounts happen automatically on drop for FUSE with AutoUnmount)
     drop(rootfs);

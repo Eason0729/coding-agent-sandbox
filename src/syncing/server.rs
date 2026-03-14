@@ -7,9 +7,11 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use log;
+use nix::errno::Errno;
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+use nix::unistd::{fork, ForkResult};
 use std::os::unix::net::{UnixListener, UnixStream};
 
-use crate::shm::ShmState;
 use crate::syncing::disk::{self, AccessLog, FuseMap, SandboxMeta};
 use crate::syncing::object::ObjectStore;
 use crate::syncing::proto::{Request, Response};
@@ -23,7 +25,83 @@ pub struct ServerState {
     pub abi_version: u32,
 }
 
-pub fn run(sandbox_dir: PathBuf, mut shm: ShmState) {
+pub trait PollLock {
+    fn poll_shutdown<F>(&mut self, on_shutdown: F) -> bool
+    where
+        F: FnOnce();
+}
+
+/// Fork and run syncing server; return when socket is ready.
+pub fn fork_and_run<P, F>(sandbox_dir: PathBuf, mut poll_lock: P, on_ready: F) -> nix::Result<()>
+where
+    P: PollLock,
+    F: FnOnce(),
+{
+    let (mut parent_sock, mut child_sock) = UnixStream::pair().map_err(|_| Errno::EIO)?;
+
+    match unsafe { fork() }? {
+        ForkResult::Parent { child } => {
+            drop(child_sock);
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            let mut ready = [0u8; 1];
+
+            loop {
+                match parent_sock.read_exact(&mut ready) {
+                    Ok(()) => {
+                        on_ready();
+                        return Ok(());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => return Err(Errno::EIO),
+                }
+
+                match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
+                    Ok(WaitStatus::StillAlive) => {}
+                    Ok(_) => return Err(Errno::ECHILD),
+                    Err(e) => return Err(e),
+                }
+
+                if std::time::Instant::now() > deadline {
+                    return Err(Errno::ETIMEDOUT);
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        ForkResult::Child => {
+            drop(parent_sock);
+            run(
+                sandbox_dir,
+                move || {
+                    let _ = child_sock.write_all(&[1]);
+                    let _ = child_sock.flush();
+                },
+                &mut poll_lock,
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn snapshot_state(state: &ServerState) -> (SandboxMeta, FuseMap) {
+    let meta = SandboxMeta {
+        shm_name: state.shm_name.clone(),
+        abi_version: state.abi_version,
+        next_id: state.objects.lock().unwrap().next_id(),
+    };
+    let fuse_map = FuseMap {
+        entries: state
+            .fuse_map
+            .iter()
+            .map(|kv| (kv.key().clone(), kv.value().clone()))
+            .collect::<HashMap<_, _>>(),
+    };
+    (meta, fuse_map)
+}
+
+pub fn run<P: PollLock>(sandbox_dir: PathBuf, ready: impl FnOnce(), poll_lock: &mut P) {
     let (meta, fuse_map) = match disk::load(&sandbox_dir) {
         Ok(m) => m,
         Err(e) => {
@@ -76,9 +154,7 @@ pub fn run(sandbox_dir: PathBuf, mut shm: ShmState) {
     )
     .expect("Failed to set socket permissions");
 
-    let mut guard = unsafe { shm.lock() };
-    guard.set_socket_ready(true);
-    drop(guard);
+    ready();
 
     if let Err(e) = listener.set_nonblocking(true) {
         log::error!("Failed to set daemon listener nonblocking: {}", e);
@@ -112,26 +188,30 @@ pub fn run(sandbox_dir: PathBuf, mut shm: ShmState) {
         }));
     }
 
+    let mut should_shutdown = false;
     loop {
         match listener.accept() {
             Ok((stream, _addr)) => {
                 let _ = tx.send(stream);
-
-                let running = shm.running_count();
-                if running == 0 {
-                    break;
-                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if shm.running_count() == 0 {
-                    break;
-                }
                 thread::sleep(Duration::from_millis(10));
             }
             Err(e) => {
                 log::error!("Accept error: {}", e);
                 break;
             }
+        }
+
+        if poll_lock.poll_shutdown(|| {
+            let (meta, fuse_map) = snapshot_state(state.as_ref());
+            if let Err(e) = disk::flush(&state.as_ref().sandbox_dir, &meta, &fuse_map) {
+                log::error!("Failed to flush metadata: {}", e);
+            }
+            let _ = std::fs::remove_file(&sock_path);
+        }) {
+            should_shutdown = true;
+            break;
         }
     }
 
@@ -140,24 +220,13 @@ pub fn run(sandbox_dir: PathBuf, mut shm: ShmState) {
         let _ = worker.join();
     }
 
-    let meta = SandboxMeta {
-        shm_name: state.as_ref().shm_name.clone(),
-        abi_version: state.as_ref().abi_version,
-        next_id: state.as_ref().objects.lock().unwrap().next_id(),
-    };
-    let fuse_map = FuseMap {
-        entries: state
-            .fuse_map
-            .iter()
-            .map(|kv| (kv.key().clone(), kv.value().clone()))
-            .collect::<HashMap<_, _>>(),
-    };
-
-    if let Err(e) = disk::flush(&state.as_ref().sandbox_dir, &meta, &fuse_map) {
-        log::error!("Failed to flush metadata: {}", e);
+    if !should_shutdown {
+        let (meta, fuse_map) = snapshot_state(state.as_ref());
+        if let Err(e) = disk::flush(&state.as_ref().sandbox_dir, &meta, &fuse_map) {
+            log::error!("Failed to flush metadata: {}", e);
+        }
+        let _ = std::fs::remove_file(&sock_path);
     }
-
-    let _ = std::fs::remove_file(&sock_path);
 
     std::process::exit(0);
 }

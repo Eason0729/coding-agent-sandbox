@@ -1686,6 +1686,37 @@ impl Filesystem for CasFuseFs {
                         }
                     }
                 };
+                if whence == 1 {
+                    let mut mat = false;
+                    if let Ok(Some(entry)) = daemon.get_entry(of.path.clone()) {
+                        if entry.metadata.size > 0 {
+                            mat = true;
+                        }
+                    }
+                    if mat {
+                        if let Err(code) = of.materialize(&root, &mut daemon) {
+                            reply.error(errno(code));
+                            return;
+                        }
+                        let seek_from = SeekFrom::Current(offset);
+                        let pos = if let FileState::CowDirty { tmp, .. } = &mut of.state {
+                            let mut f = tmp_as_file(tmp);
+                            f.seek(seek_from)
+                        } else {
+                            Err(std::io::Error::from_raw_os_error(libc::EIO))
+                        };
+                        match pos {
+                            Ok(p) => {
+                                reply.offset(p as i64);
+                                return;
+                            }
+                            Err(e) => {
+                                reply.error(errno(e.raw_os_error().unwrap_or(libc::EIO)));
+                                return;
+                            }
+                        }
+                    }
+                }
                 let new_pos = match whence {
                     0 => offset as u64,
                     1 => {
@@ -1710,6 +1741,25 @@ impl Filesystem for CasFuseFs {
                         return;
                     }
                 };
+                if whence == 1 {
+                    if let Err(code) = of.write_at(0, &[], &root, &mut daemon) {
+                        reply.error(errno(code));
+                        return;
+                    }
+                    if let FileState::FuseOnlyDirtyRanged {
+                        logical_size,
+                        truncate_to,
+                        ..
+                    } = &mut of.state
+                    {
+                        let current = truncate_to.unwrap_or(*logical_size);
+                        let new_pos = (current as i64).saturating_add(offset).max(0) as u64;
+                        *logical_size = new_pos;
+                        *truncate_to = Some(new_pos);
+                        reply.offset(new_pos as i64);
+                        return;
+                    }
+                }
                 let new_pos = match whence {
                     0 => offset as u64,
                     1 => {

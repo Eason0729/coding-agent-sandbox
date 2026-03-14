@@ -59,11 +59,46 @@ Do not pass options as a parameter to `run_fuse`.
 The `cas run` command:
 1. Loads `.sandbox/metadata.bin` to get `shm_name`
 2. Opens or creates the POSIX SHM segment (`/cas-<shm_name>`)
-3. Increments `running_count` atomically
+3. Locks SHM mutex, reads/increments `running_count`, and updates `socket_ready` when needed
 4. If `running_count` was 0 before increment: fork a child to run the syncing daemon
-5. Waits for `socket_ready` flag in SHM
+5. Waits for `socket_ready` flag in SHM and successful socket connect
 6. Forks again to create the sandboxed execution environment
-7. On child exit: decrements `running_count`
+7. On child exit: locks SHM mutex and decrements `running_count`
+
+## Shared-State Rule
+
+Do not use `fetch_add`/`fetch_sub` on `running_count` for run-lifecycle transitions.
+
+`running_count` participates in a larger critical section that also includes daemon startup/shutdown
+state (`socket_ready`, fork timing, socket bind readiness). These transitions must be performed while
+holding the SHM mutex.
+
+## Runtime Robustness
+
+To avoid stale SHM/socket races and silent hangs:
+
+1. When `running_count` transitions 0→1, clear `socket_ready` before starting a new daemon.
+2. `cas run` must wait for both conditions before proceeding:
+   - `socket_ready == 1`
+   - `UnixStream::connect(daemon.sock)` succeeds
+3. Waiting is bounded (timeout) and returns an explicit run error on failure.
+4. Timeout should be generous enough to avoid false negatives on busy hosts (15s).
+
+## Running Count Safety
+
+`running_count` must be decremented on every early-return error path after increment.
+
+Use an RAII guard in `cmd_run` so failures in daemon readiness checks or setup paths cannot leak
+`running_count` and cause future runs to skip daemon startup incorrectly.
+
+## FUSE Readiness
+
+`wait_for_fuse_ready` must be bounded and detect early daemon death:
+
+1. Poll mountpoint device change as before.
+2. Concurrently `waitpid(..., WNOHANG)` on the FUSE daemon child.
+3. If the child exits/signals before mount completion, fail fast with a clear error.
+4. If timeout is reached, fail with timeout error instead of waiting forever.
 
 ## Imports
 

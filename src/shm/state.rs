@@ -20,38 +20,8 @@ impl ShmStateLayout {
         }
     }
 
-    pub fn mutex_ptr(&mut self) -> *mut pthread_mutex_t {
-        &mut self.mutex
-    }
-
-    pub fn running_count(&self) -> &AtomicU32 {
-        &self.running_count
-    }
-
-    pub fn running_count_mut(&mut self) -> &mut AtomicU32 {
-        &mut self.running_count
-    }
-
-    pub fn socket_ready(&self) -> &AtomicU32 {
-        &self.socket_ready
-    }
-
-    pub fn socket_ready_mut(&mut self) -> &mut AtomicU32 {
-        &mut self.socket_ready
-    }
-
-    pub fn increment_running_count(&self) -> u32 {
-        self.running_count
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-    }
-
-    pub fn decrement_running_count(&self) -> u32 {
-        self.running_count
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
-    }
-
-    pub fn get_running_count(&self) -> u32 {
-        self.running_count.load(std::sync::atomic::Ordering::SeqCst)
+    pub fn mutex_ptr(&self) -> *mut pthread_mutex_t {
+        &self.mutex as *const pthread_mutex_t as *mut pthread_mutex_t
     }
 
     pub fn is_socket_ready(&self) -> bool {
@@ -80,6 +50,21 @@ impl ShmState {
 
         unsafe {
             std::ptr::write(state, ShmStateLayout::new());
+            let mut attr: libc::pthread_mutexattr_t = std::mem::zeroed();
+            let r = libc::pthread_mutexattr_init(&mut attr);
+            if r != 0 {
+                return Err(super::region::ShmError::Open(r));
+            }
+            let r = libc::pthread_mutexattr_setpshared(&mut attr, libc::PTHREAD_PROCESS_SHARED);
+            if r != 0 {
+                libc::pthread_mutexattr_destroy(&mut attr);
+                return Err(super::region::ShmError::Open(r));
+            }
+            let r = libc::pthread_mutex_init(state.mutex_ptr(), &attr);
+            libc::pthread_mutexattr_destroy(&mut attr);
+            if r != 0 {
+                return Err(super::region::ShmError::Open(r));
+            }
         }
 
         Ok(Self { region, state })
@@ -94,44 +79,9 @@ impl ShmState {
         Ok(Self { region, state })
     }
 
-    pub fn state(&self) -> &ShmStateLayout {
-        self.state
-    }
-
-    pub fn state_mut(&mut self) -> &mut ShmStateLayout {
-        self.state
-    }
-
-    pub fn name(&self) -> &str {
-        self.region.name()
-    }
-
-    pub fn mutex_ptr(&mut self) -> *mut pthread_mutex_t {
-        self.state.mutex_ptr()
-    }
-
-    pub fn socket_ready(&self) -> bool {
-        self.state.is_socket_ready()
-    }
-
-    pub fn set_socket_ready(&self, ready: bool) {
-        self.state.set_socket_ready(ready);
-    }
-
-    pub fn running_count(&self) -> u32 {
-        self.state.get_running_count()
-    }
-
-    pub fn increment_running_count(&self) -> u32 {
-        self.state.increment_running_count()
-    }
-
-    pub fn decrement_running_count(&self) -> u32 {
-        self.state.decrement_running_count()
-    }
-
-    pub unsafe fn lock(&mut self) -> super::mutex::ShmGuard {
-        super::mutex::ShmGuard::new(self.state.mutex_ptr(), self.state as *mut ShmStateLayout)
+    pub unsafe fn lock(&self) -> super::mutex::ShmGuard {
+        let state_ptr = self.state as *const ShmStateLayout as *mut ShmStateLayout;
+        super::mutex::ShmGuard::new(self.state.mutex_ptr(), state_ptr)
             .expect("Failed to lock mutex")
     }
 }

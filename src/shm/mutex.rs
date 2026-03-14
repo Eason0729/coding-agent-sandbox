@@ -1,4 +1,6 @@
-use libc::{pthread_mutex_t, pthread_mutexattr_t, PTHREAD_PROCESS_SHARED};
+use std::sync::atomic::Ordering;
+
+use libc::pthread_mutex_t;
 use nix::errno::Errno;
 use thiserror::Error;
 
@@ -15,6 +17,14 @@ pub enum MutexError {
 pub struct ShmGuard {
     mutex: *mut pthread_mutex_t,
     state: *mut ShmStateLayout,
+}
+
+impl Drop for ShmGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::pthread_mutex_unlock(self.mutex);
+        }
+    }
 }
 
 impl ShmGuard {
@@ -36,66 +46,56 @@ impl ShmGuard {
     }
 
     pub fn get_running_count(&self) -> u32 {
-        unsafe { (*self.state).get_running_count() }
+        unsafe { (*self.state).running_count.load(Ordering::Acquire) }
     }
 
-    pub fn decrement_running_count(&self) -> u32 {
-        unsafe { (*self.state).decrement_running_count() }
+    /// Increments the running count and returns the previous value.
+    pub fn increment(&mut self) -> u32 {
+        unsafe { (*self.state).running_count.fetch_add(1, Ordering::AcqRel) }
     }
-}
 
-impl Drop for ShmGuard {
-    fn drop(&mut self) {
+    pub fn decrement(&mut self) {
         unsafe {
-            libc::pthread_mutex_unlock(self.mutex);
+            (*self.state).running_count.fetch_sub(1, Ordering::AcqRel);
         }
     }
+
+    pub fn is_socket_ready(&self) -> bool {
+        unsafe { (*self.state).is_socket_ready() }
+    }
+
+    /// discard the lock without unlocking
+    pub fn disarm(self) {
+        std::mem::forget(self);
+    }
 }
 
-unsafe impl Send for ShmGuard {}
-unsafe impl Sync for ShmGuard {}
-
 pub unsafe fn adopt_mutex_after_fork(state: &mut ShmStateLayout) -> Result<(), MutexError> {
-    let mutex_ptr = state.mutex_ptr();
+    let mut attr: libc::pthread_mutexattr_t = std::mem::zeroed();
 
-    let ret = libc::pthread_mutex_destroy(mutex_ptr);
-    if ret != 0 && ret != libc::EBUSY {
-        return Err(MutexError::Pthread(Errno::from_raw(ret)));
+    let init_attr = libc::pthread_mutexattr_init(&mut attr);
+    if init_attr != 0 {
+        return Err(MutexError::Pthread(Errno::from_raw(init_attr)));
     }
 
-    let mut attr: pthread_mutexattr_t = std::mem::zeroed();
-
-    let ret = libc::pthread_mutexattr_init(&mut attr);
-    if ret != 0 {
-        return Err(MutexError::Pthread(Errno::from_raw(ret)));
-    }
-
-    let ret = libc::pthread_mutexattr_setpshared(&mut attr, PTHREAD_PROCESS_SHARED as i32);
-    if ret != 0 {
+    let set_shared = libc::pthread_mutexattr_setpshared(&mut attr, libc::PTHREAD_PROCESS_SHARED);
+    if set_shared != 0 {
         libc::pthread_mutexattr_destroy(&mut attr);
-        return Err(MutexError::Pthread(Errno::from_raw(ret)));
+        return Err(MutexError::Pthread(Errno::from_raw(set_shared)));
     }
 
-    let ret = libc::pthread_mutex_init(mutex_ptr, &attr);
-    if ret != 0 {
-        libc::pthread_mutexattr_destroy(&mut attr);
-        return Err(MutexError::Pthread(Errno::from_raw(ret)));
-    }
+    let mutex = state.mutex_ptr();
+    let _ = libc::pthread_mutex_destroy(mutex);
 
-    let ret = libc::pthread_mutexattr_destroy(&mut attr);
-    if ret != 0 {
-        return Err(MutexError::Pthread(Errno::from_raw(ret)));
-    }
+    let init_mutex = libc::pthread_mutex_init(mutex, &attr);
+    libc::pthread_mutexattr_destroy(&mut attr);
 
-    let ret = libc::pthread_mutex_lock(mutex_ptr);
-    if ret != 0 {
-        return Err(MutexError::Pthread(Errno::from_raw(ret)));
-    }
-
-    let ret = libc::pthread_mutex_unlock(mutex_ptr);
-    if ret != 0 {
-        return Err(MutexError::Pthread(Errno::from_raw(ret)));
+    if init_mutex != 0 {
+        return Err(MutexError::Pthread(Errno::from_raw(init_mutex)));
     }
 
     Ok(())
 }
+
+unsafe impl Send for ShmGuard {}
+unsafe impl Sync for ShmGuard {}
