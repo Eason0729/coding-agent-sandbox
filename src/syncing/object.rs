@@ -57,6 +57,20 @@ impl ObjectStore {
         Ok(data)
     }
 
+    pub fn get_range(&self, id: u64, offset: u64, len: usize) -> Result<Vec<u8>, ObjectError> {
+        let path = self.object_path(id);
+        if !path.exists() {
+            return Err(ObjectError::NotFound(id));
+        }
+        let mut file = File::open(&path)?;
+        use std::io::Seek;
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        let mut data = vec![0u8; len];
+        let n = file.read(&mut data)?;
+        data.truncate(n);
+        Ok(data)
+    }
+
     pub fn exists(&self, id: u64) -> bool {
         self.object_path(id).exists()
     }

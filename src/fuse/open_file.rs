@@ -1,4 +1,4 @@
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 
 use crate::syncing::client::SyncClient;
-use crate::syncing::proto::{EntryType, FileMetadata, FuseEntry};
+use crate::syncing::proto::{BytePatch, FileMetadata};
 
 pub const TTL: Duration = Duration::from_secs(1);
 
@@ -31,6 +31,13 @@ pub enum FileState {
     FuseOnlyDirty {
         tmp: NamedTempFile,
         object_id: u64,
+    },
+    FuseOnlyDirtyRanged {
+        object_id: u64,
+        base_size: u64,
+        patches: Vec<BytePatch>,
+        truncate_to: Option<u64>,
+        logical_size: u64,
     },
 }
 
@@ -128,6 +135,37 @@ impl OpenFile {
                     .map_err(|_| libc::EIO)?;
                 Ok(())
             }
+            FileState::FuseOnlyDirtyRanged {
+                object_id: _,
+                patches,
+                truncate_to,
+                logical_size,
+                ..
+            } => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let file_meta = FileMetadata {
+                    size: truncate_to.unwrap_or(*logical_size),
+                    mode: libc::S_IFREG | 0o644,
+                    uid: 0,
+                    gid: 0,
+                    mtime: now,
+                    atime: now,
+                    ctime: now,
+                };
+                let new_id = daemon
+                    .patch_file(
+                        self.path.clone(),
+                        std::mem::take(patches),
+                        *truncate_to,
+                        file_meta,
+                    )
+                    .map_err(|_| libc::EIO)?;
+                self.state = FileState::FuseOnlyClean { object_id: new_id };
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -211,6 +249,45 @@ impl OpenFile {
                     Err(_) => Err(libc::EIO),
                 }
             }
+            FileState::FuseOnlyDirtyRanged {
+                object_id,
+                patches,
+                truncate_to,
+                base_size,
+                logical_size,
+            } => {
+                let effective_size = truncate_to.unwrap_or(*logical_size);
+                if offset >= effective_size {
+                    return Ok(vec![]);
+                }
+                let wanted = (effective_size - offset).min(size as u64) as usize;
+                let mut out = vec![0u8; wanted];
+
+                let base_read = daemon
+                    .get_object_range(*object_id, offset, wanted as u32)
+                    .map_err(|_| libc::EIO)?;
+                let base_len = base_read.len().min(out.len());
+                out[..base_len].copy_from_slice(&base_read[..base_len]);
+
+                for patch in patches.iter() {
+                    let p_start = patch.offset;
+                    let p_end = patch.offset.saturating_add(patch.data.len() as u64);
+                    let r_start = offset;
+                    let r_end = offset.saturating_add(out.len() as u64);
+                    let ov_start = p_start.max(r_start);
+                    let ov_end = p_end.min(r_end);
+                    if ov_start >= ov_end {
+                        continue;
+                    }
+                    let src_start = (ov_start - p_start) as usize;
+                    let dst_start = (ov_start - r_start) as usize;
+                    let n = (ov_end - ov_start) as usize;
+                    out[dst_start..dst_start + n]
+                        .copy_from_slice(&patch.data[src_start..src_start + n]);
+                }
+
+                Ok(out)
+            }
         }
     }
 
@@ -260,25 +337,39 @@ impl OpenFile {
             }
             FileState::FuseOnlyClean { object_id } => {
                 let id = *object_id;
-                match daemon.get_object(id) {
-                    Ok(bytes) => {
-                        let mut tmp = NamedTempFile::new().map_err(|_| libc::EIO)?;
-                        let _ = tmp.write_all(&bytes);
-                        let _ = tmp.seek(SeekFrom::Start(offset));
-                        {
-                            let mut f = tmp_as_file(&tmp);
-                            f.seek(SeekFrom::Start(offset)).ok();
-                            match f.write(data) {
-                                Ok(n) => {
-                                    self.state = FileState::FuseOnlyDirty { tmp, object_id: id };
-                                    Ok(n)
-                                }
-                                Err(e) => Err(e.raw_os_error().unwrap_or(libc::EIO)),
-                            }
-                        }
-                    }
-                    Err(_) => Err(libc::EIO),
+                let base_size = daemon
+                    .get_entry(self.path.clone())
+                    .map_err(|_| libc::EIO)?
+                    .map(|e| e.metadata.size)
+                    .unwrap_or(0);
+                let write_end = offset.saturating_add(data.len() as u64);
+                self.state = FileState::FuseOnlyDirtyRanged {
+                    object_id: id,
+                    base_size,
+                    patches: vec![BytePatch {
+                        offset,
+                        data: data.to_vec(),
+                    }],
+                    truncate_to: None,
+                    logical_size: base_size.max(write_end),
+                };
+                Ok(data.len())
+            }
+            FileState::FuseOnlyDirtyRanged {
+                patches,
+                logical_size,
+                truncate_to,
+                ..
+            } => {
+                patches.push(BytePatch {
+                    offset,
+                    data: data.to_vec(),
+                });
+                *logical_size = (*logical_size).max(offset.saturating_add(data.len() as u64));
+                if let Some(t) = *truncate_to {
+                    *truncate_to = Some(t.max(offset.saturating_add(data.len() as u64)));
                 }
+                Ok(data.len())
             }
         }
     }
@@ -361,6 +452,21 @@ impl OpenFile {
                     Err(_) => Err(libc::EIO),
                 }
             }
+            FileState::FuseOnlyDirtyRanged { .. } => {
+                self.read_at(offset_in, len as u32, root, daemon)
+            }
+        }
+    }
+
+    pub fn set_ranged_size(&mut self, size: u64) {
+        if let FileState::FuseOnlyDirtyRanged {
+            truncate_to,
+            logical_size,
+            ..
+        } = &mut self.state
+        {
+            *truncate_to = Some(size);
+            *logical_size = size;
         }
     }
 }

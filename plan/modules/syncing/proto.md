@@ -18,6 +18,28 @@ Implement `syncing/proto.rs` — shared data types for serialization and the req
 | `log_access(&mut self, path: PathBuf, operation: String, pid: u32) -> Result<()>` | `LogAccess` | `Ok` |
 | `flush(&mut self) -> Result<()>` | `Flush` | `Ok` |
 
+## Protocol v2 (breaking)
+
+`PutObject`/`GetObject` remain for full blob operations, but v2 canonical data path is ranged:
+
+| Intent | Request sent | Expected response |
+|---|---|---|
+| `get_object_range(&mut self, id: u64, offset: u64, len: u32) -> Result<Vec<u8>>` | `GetObjectRange` | `GetObjectRange { data }` |
+| `patch_file(&mut self, path: PathBuf, patches: Vec<BytePatch>, truncate_to: Option<u64>, meta: FileMetadata) -> Result<u64>` | `PatchFile` | `PatchFile { id }` |
+
+### BytePatch
+
+`BytePatch` is an absolute in-file update:
+
+```rust
+struct BytePatch {
+    offset: u64,
+    data: Vec<u8>,
+}
+```
+
+Patches are applied in request order. Overlapping ranges are allowed; later patches overwrite earlier bytes.
+
 ## Derive Bounds
 
 All types derive `serde::Serialize + serde::Deserialize` and `Debug`.

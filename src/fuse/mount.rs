@@ -15,33 +15,18 @@ pub fn run_fuse(fs: CasFuseFs, mountpoint: &Path) -> io::Result<()> {
     let options = vec![MountOption::FSName("cas".to_string())];
 
     let mut config = fuser::Config::default();
+
+    let thread_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(1);
+
+    config.n_threads = Some(thread_count);
+
     for opt in options {
         config.mount_options.push(opt);
     }
 
-    fuser::mount2(fs, mountpoint, &config)
-}
-
-/// Unmount the FUSE filesystem at `mountpoint`.
-///
-/// Called by the parent process after the sandboxed child exits, to tear down
-/// the FUSE session that `run_fuse` is blocking on.
-pub fn unmount(mountpoint: &Path) -> io::Result<()> {
-    // fuser does not expose a standalone unmount helper, so we call the system
-    // `fusermount -u` / `umount` directly.
-    let status = std::process::Command::new("fusermount")
-        .args(["-u", &mountpoint.to_string_lossy()])
-        .status();
-
-    match status {
-        Ok(s) if s.success() => Ok(()),
-        Ok(s) => Err(io::Error::other(format!(
-            "fusermount -u exited with status {s}"
-        ))),
-        // fusermount may not be available inside the user namespace; fall back
-        // to the plain umount(2) syscall via the `nix` crate.
-        Err(_) => {
-            nix::mount::umount(mountpoint).map_err(|e| io::Error::from_raw_os_error(e as i32))
-        }
-    }
+    let session = fuser::spawn_mount2(fs, mountpoint, &config)?;
+    session.join()
 }

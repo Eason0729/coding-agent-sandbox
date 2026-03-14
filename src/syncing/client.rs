@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-use crate::syncing::proto::{DirMetadata, FileMetadata, FuseEntry, Request, Response};
+use crate::syncing::proto::{BytePatch, DirMetadata, FileMetadata, FuseEntry, Request, Response};
 
 #[derive(Error, Debug)]
 pub enum ClientError {
@@ -67,6 +67,20 @@ impl SyncClient {
         }
     }
 
+    pub fn get_object_range(
+        &mut self,
+        id: u64,
+        offset: u64,
+        len: u32,
+    ) -> Result<Vec<u8>, ClientError> {
+        let response = self.send_request(Request::GetObjectRange { id, offset, len })?;
+        match response {
+            Response::GetObjectRange { data } => Ok(data),
+            Response::Error(msg) => Err(ClientError::Server(msg)),
+            _ => Err(ClientError::Server("Unexpected response".to_string())),
+        }
+    }
+
     pub fn put_file(
         &mut self,
         path: PathBuf,
@@ -76,6 +90,26 @@ impl SyncClient {
         let response = self.send_request(Request::PutFile { path, data, meta })?;
         match response {
             Response::PutFile { id } => Ok(id),
+            Response::Error(msg) => Err(ClientError::Server(msg)),
+            _ => Err(ClientError::Server("Unexpected response".to_string())),
+        }
+    }
+
+    pub fn patch_file(
+        &mut self,
+        path: PathBuf,
+        patches: Vec<BytePatch>,
+        truncate_to: Option<u64>,
+        meta: FileMetadata,
+    ) -> Result<u64, ClientError> {
+        let response = self.send_request(Request::PatchFile {
+            path,
+            patches,
+            truncate_to,
+            meta,
+        })?;
+        match response {
+            Response::PatchFile { id } => Ok(id),
             Response::Error(msg) => Err(ClientError::Server(msg)),
             _ => Err(ClientError::Server("Unexpected response".to_string())),
         }

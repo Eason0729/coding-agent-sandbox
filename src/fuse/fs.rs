@@ -99,7 +99,7 @@ struct Inner {
 }
 
 impl Inner {
-    fn path_of(&self, ino: INodeNo) -> Option<&Path> {
+    fn path_of(&self, ino: INodeNo) -> Option<PathBuf> {
         self.inodes.get_path(ino.0)
     }
 
@@ -116,7 +116,7 @@ impl Inner {
     }
 
     fn resolve_ino(&self, ino: INodeNo) -> Option<(INodeNo, PathBuf)> {
-        self.inodes.get_path(ino.0).map(|p| (ino, p.to_path_buf()))
+        self.inodes.get_path(ino.0).map(|p| (ino, p))
     }
 
     fn stat_path(
@@ -311,7 +311,7 @@ impl Filesystem for CasFuseFs {
             &format!("parent={} name={}", parent.0, name.to_string_lossy()),
         );
         let mut g = self.lock();
-        let parent_path = match g.path_of(parent).map(Path::to_path_buf) {
+        let parent_path = match g.path_of(parent) {
             Some(p) => p,
             None => {
                 self.req_err(req, "lookup", None, libc::ENOENT, "parent inode missing");
@@ -345,7 +345,7 @@ impl Filesystem for CasFuseFs {
     fn getattr(&self, req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         self.req_start(req, "getattr", None, &format!("ino={}", ino.0));
         let mut g = self.lock();
-        let path = match g.path_of(ino).map(Path::to_path_buf) {
+        let path = match g.path_of(ino) {
             Some(p) => p,
             None => {
                 self.req_err(req, "getattr", None, libc::ENOENT, "inode missing");
@@ -387,7 +387,7 @@ impl Filesystem for CasFuseFs {
         reply: ReplyAttr,
     ) {
         let mut g = self.lock();
-        let path = match g.path_of(ino).map(Path::to_path_buf) {
+        let path = match g.path_of(ino) {
             Some(p) => p,
             None => {
                 reply.error(Errno::ENOENT);
@@ -493,13 +493,22 @@ impl Filesystem for CasFuseFs {
                                         reply.error(errno(code));
                                         return;
                                     }
-                                    if let FileState::FuseOnlyDirty { tmp, .. } = &mut of.state {
-                                        if let Err(e) = tmp.as_file_mut().set_len(sz) {
-                                            g.open_files.insert(fh.0, of);
-                                            reply.error(errno(io_errno(&e)));
-                                            return;
+                                    match &mut of.state {
+                                        FileState::FuseOnlyDirty { tmp, .. } => {
+                                            if let Err(e) = tmp.as_file_mut().set_len(sz) {
+                                                g.open_files.insert(fh.0, of);
+                                                reply.error(errno(io_errno(&e)));
+                                                return;
+                                            }
                                         }
+                                        FileState::FuseOnlyDirtyRanged { .. } => {
+                                            of.set_ranged_size(sz);
+                                        }
+                                        _ => {}
                                     }
+                                }
+                                FileState::FuseOnlyDirtyRanged { .. } => {
+                                    of.set_ranged_size(sz);
                                 }
                                 FileState::Passthrough { .. } => {}
                             }
@@ -581,7 +590,7 @@ impl Filesystem for CasFuseFs {
 
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
         let mut g = self.lock();
-        let path = match g.path_of(ino).map(Path::to_path_buf) {
+        let path = match g.path_of(ino) {
             Some(p) => p,
             None => {
                 reply.error(Errno::ENOENT);
@@ -671,7 +680,7 @@ impl Filesystem for CasFuseFs {
         reply: ReplyEntry,
     ) {
         let mut g = self.lock();
-        let parent_path = match g.path_of(parent).map(Path::to_path_buf) {
+        let parent_path = match g.path_of(parent) {
             Some(p) => p,
             None => {
                 reply.error(Errno::ENOENT);
@@ -725,7 +734,7 @@ impl Filesystem for CasFuseFs {
 
     fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let mut g = self.lock();
-        let parent_path = match g.path_of(parent).map(Path::to_path_buf) {
+        let parent_path = match g.path_of(parent) {
             Some(p) => p,
             None => {
                 reply.error(Errno::ENOENT);
@@ -777,7 +786,7 @@ impl Filesystem for CasFuseFs {
 
     fn rmdir(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let mut g = self.lock();
-        let parent_path = match g.path_of(parent).map(Path::to_path_buf) {
+        let parent_path = match g.path_of(parent) {
             Some(p) => p,
             None => {
                 reply.error(Errno::ENOENT);
@@ -842,14 +851,14 @@ impl Filesystem for CasFuseFs {
         reply: ReplyEmpty,
     ) {
         let mut g = self.lock();
-        let from_parent = match g.path_of(parent).map(Path::to_path_buf) {
+        let from_parent = match g.path_of(parent) {
             Some(p) => p,
             None => {
                 reply.error(Errno::ENOENT);
                 return;
             }
         };
-        let to_parent = match g.path_of(newparent).map(Path::to_path_buf) {
+        let to_parent = match g.path_of(newparent) {
             Some(p) => p,
             None => {
                 reply.error(Errno::ENOENT);
@@ -894,7 +903,7 @@ impl Filesystem for CasFuseFs {
         reply: ReplyEntry,
     ) {
         let mut g = self.lock();
-        let parent_path = match g.path_of(parent).map(Path::to_path_buf) {
+        let parent_path = match g.path_of(parent) {
             Some(p) => p,
             None => {
                 reply.error(Errno::ENOENT);
@@ -1139,7 +1148,7 @@ impl Filesystem for CasFuseFs {
             ),
         );
         let mut g = self.lock();
-        let parent_path = match g.path_of(parent).map(Path::to_path_buf) {
+        let parent_path = match g.path_of(parent) {
             Some(p) => p,
             None => {
                 self.req_err(req, "create", None, libc::ENOENT, "parent inode missing");
@@ -1529,6 +1538,40 @@ impl Filesystem for CasFuseFs {
                         }
                     }
                 };
+                if whence == 1 {
+                    let mut mat = false;
+                    if let Ok(Some(entry)) = g.daemon.get_entry(of.path.clone()) {
+                        if entry.metadata.size > 0 {
+                            mat = true;
+                        }
+                    }
+                    if mat {
+                        if let Err(code) = of.materialize(&root, &mut g.daemon) {
+                            g.open_files.insert(fh.0, of);
+                            reply.error(errno(code));
+                            return;
+                        }
+                        let seek_from = SeekFrom::Current(offset);
+                        let pos = if let FileState::CowDirty { tmp, .. } = &mut of.state {
+                            let mut f = tmp_as_file(tmp);
+                            f.seek(seek_from)
+                        } else {
+                            Err(std::io::Error::from_raw_os_error(libc::EIO))
+                        };
+                        g.open_files.insert(fh.0, of);
+                        match pos {
+                            Ok(p) => {
+                                reply.offset(p as i64);
+                                return;
+                            }
+                            Err(e) => {
+                                reply.error(errno(e.raw_os_error().unwrap_or(libc::EIO)));
+                                return;
+                            }
+                        }
+                    }
+                }
+
                 let new_pos = match whence {
                     0 => offset as u64,
                     1 => {
@@ -1547,14 +1590,38 @@ impl Filesystem for CasFuseFs {
             }
             FileState::FuseOnlyClean { object_id } => {
                 let id = *object_id;
-                let size = match g.daemon.get_object(id) {
-                    Ok(bytes) => bytes.len() as u64,
+                let size = match g.daemon.get_entry(of.path.clone()) {
+                    Ok(Some(entry)) => entry.metadata.size,
+                    Ok(None) => 0,
                     Err(_) => {
                         g.open_files.insert(fh.0, of);
                         reply.error(Errno::EIO);
                         return;
                     }
                 };
+
+                if whence == 1 {
+                    if let Err(code) = of.write_at(0, &[], &root, &mut g.daemon) {
+                        g.open_files.insert(fh.0, of);
+                        reply.error(errno(code));
+                        return;
+                    }
+                    if let FileState::FuseOnlyDirtyRanged {
+                        logical_size,
+                        truncate_to,
+                        ..
+                    } = &mut of.state
+                    {
+                        let current = truncate_to.unwrap_or(*logical_size);
+                        let new_pos = (current as i64).saturating_add(offset).max(0) as u64;
+                        *logical_size = new_pos;
+                        *truncate_to = Some(new_pos);
+                        g.open_files.insert(fh.0, of);
+                        reply.offset(new_pos as i64);
+                        return;
+                    }
+                }
+
                 let new_pos = match whence {
                     0 => offset as u64,
                     1 => {
@@ -1569,6 +1636,26 @@ impl Filesystem for CasFuseFs {
                         return;
                     }
                 };
+                Ok(new_pos)
+            }
+            FileState::FuseOnlyDirtyRanged {
+                logical_size,
+                truncate_to,
+                ..
+            } => {
+                let size = truncate_to.unwrap_or(*logical_size);
+                let new_pos = match whence {
+                    0 => offset as u64,
+                    1 => (size as i64).saturating_add(offset).max(0) as u64,
+                    2 => (size as i64).saturating_add(offset) as u64,
+                    _ => {
+                        g.open_files.insert(fh.0, of);
+                        reply.error(Errno::EINVAL);
+                        return;
+                    }
+                };
+                *logical_size = new_pos;
+                *truncate_to = Some(new_pos);
                 Ok(new_pos)
             }
         };
@@ -1599,7 +1686,7 @@ impl Filesystem for CasFuseFs {
         mut reply: ReplyDirectory,
     ) {
         let mut g = self.lock();
-        let path = match g.path_of(ino).map(Path::to_path_buf) {
+        let path = match g.path_of(ino) {
             Some(p) => p,
             None => {
                 reply.error(Errno::ENOENT);
@@ -1933,6 +2020,19 @@ impl Filesystem for CasFuseFs {
                             );
                         }
                     }
+                }
+                Ok(())
+            }
+            FileState::FuseOnlyDirtyRanged {
+                logical_size,
+                truncate_to,
+                ..
+            } => {
+                let end = offset.saturating_add(length);
+                let mode_keep_size = mode & libc::FALLOC_FL_KEEP_SIZE as i32;
+                if mode_keep_size == 0 {
+                    *logical_size = (*logical_size).max(end);
+                    *truncate_to = Some((*truncate_to).unwrap_or(*logical_size).max(end));
                 }
                 Ok(())
             }

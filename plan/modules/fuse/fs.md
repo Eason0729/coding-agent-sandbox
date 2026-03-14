@@ -58,6 +58,16 @@ Each FUSE handler follows a consistent pattern:
 4. Delegate to `OpenFile` methods for actual I/O
 5. Return result via reply
 
+## Performance Update (v2)
+
+The single global `Arc<Mutex<Inner>>` is replaced by finer-grained synchronization:
+
+- inode table: per-row concurrent hashmap
+- open file table: concurrent hashmap of `fh -> Arc<Mutex<OpenFile>>`
+- daemon client: one client per request thread (or pool), not a single shared stream behind the global lock
+
+Goal: allow independent FUSE operations on distinct files/inodes to proceed concurrently.
+
 **Example: read handler (~15 lines)**
 
 ```rust

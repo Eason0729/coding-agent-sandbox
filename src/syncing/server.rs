@@ -1,8 +1,13 @@
+use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
+use dashmap::DashMap;
 use log;
-use unix_socket::{UnixListener, UnixStream};
+use std::os::unix::net::{UnixListener, UnixStream};
 
 use crate::shm::ShmState;
 use crate::syncing::disk::{self, AccessLog, FuseMap, SandboxMeta};
@@ -11,7 +16,7 @@ use crate::syncing::proto::{Request, Response};
 
 pub struct ServerState {
     pub objects: Mutex<ObjectStore>,
-    pub fuse_map: Mutex<FuseMap>,
+    pub fuse_map: DashMap<PathBuf, crate::syncing::proto::FuseEntry>,
     pub access_log: Mutex<AccessLog>,
     pub sandbox_dir: PathBuf,
     pub shm_name: String,
@@ -39,14 +44,14 @@ pub fn run(sandbox_dir: PathBuf, mut shm: ShmState) {
         }
     };
 
-    let state = ServerState {
+    let state = Arc::new(ServerState {
         objects: Mutex::new(object_store),
-        fuse_map: Mutex::new(fuse_map),
+        fuse_map: DashMap::from_iter(fuse_map.entries),
         access_log: Mutex::new(access_log),
         sandbox_dir: sandbox_dir.clone(),
         shm_name: meta.shm_name.clone(),
         abi_version: meta.abi_version,
-    };
+    });
 
     let sock_path = sandbox_dir.join(".sandbox").join("daemon.sock");
     if let Some(parent) = sock_path.parent() {
@@ -75,17 +80,53 @@ pub fn run(sandbox_dir: PathBuf, mut shm: ShmState) {
     guard.set_socket_ready(true);
     drop(guard);
 
+    if let Err(e) = listener.set_nonblocking(true) {
+        log::error!("Failed to set daemon listener nonblocking: {}", e);
+        std::process::exit(1);
+    }
+
+    let thread_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(4)
+        .max(1);
+
+    let (tx, rx) = mpsc::channel::<UnixStream>();
+    let rx = Arc::new(Mutex::new(rx));
+    let mut workers = Vec::with_capacity(thread_count);
+
+    for _ in 0..thread_count {
+        let state_ref = Arc::clone(&state);
+        let rx_ref = Arc::clone(&rx);
+        workers.push(thread::spawn(move || loop {
+            let stream = {
+                let guard = rx_ref.lock().unwrap();
+                guard.recv()
+            };
+            let Ok(stream) = stream else {
+                break;
+            };
+            if let Err(e) = handle_connection(state_ref.as_ref(), stream) {
+                log::error!("Connection error: {}", e);
+            }
+        }));
+    }
+
     loop {
         match listener.accept() {
             Ok((stream, _addr)) => {
-                if let Err(e) = handle_connection(&state, stream) {
-                    log::error!("Connection error: {}", e);
-                }
+                let _ = tx.send(stream);
 
                 let running = shm.running_count();
                 if running == 0 {
                     break;
                 }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if shm.running_count() == 0 {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
             }
             Err(e) => {
                 log::error!("Accept error: {}", e);
@@ -94,14 +135,25 @@ pub fn run(sandbox_dir: PathBuf, mut shm: ShmState) {
         }
     }
 
-    let meta = SandboxMeta {
-        shm_name: state.shm_name.clone(),
-        abi_version: state.abi_version,
-        next_id: state.objects.lock().unwrap().next_id(),
-    };
-    let fuse_map = state.fuse_map.lock().unwrap().clone();
+    drop(tx);
+    for worker in workers {
+        let _ = worker.join();
+    }
 
-    if let Err(e) = disk::flush(&state.sandbox_dir, &meta, &fuse_map) {
+    let meta = SandboxMeta {
+        shm_name: state.as_ref().shm_name.clone(),
+        abi_version: state.as_ref().abi_version,
+        next_id: state.as_ref().objects.lock().unwrap().next_id(),
+    };
+    let fuse_map = FuseMap {
+        entries: state
+            .fuse_map
+            .iter()
+            .map(|kv| (kv.key().clone(), kv.value().clone()))
+            .collect::<HashMap<_, _>>(),
+    };
+
+    if let Err(e) = disk::flush(&state.as_ref().sandbox_dir, &meta, &fuse_map) {
         log::error!("Failed to flush metadata: {}", e);
     }
 
@@ -109,9 +161,6 @@ pub fn run(sandbox_dir: PathBuf, mut shm: ShmState) {
 
     std::process::exit(0);
 }
-
-use std::io::{Read, Write};
-
 fn handle_connection(
     state: &ServerState,
     mut stream: UnixStream,
@@ -158,9 +207,15 @@ fn dispatch(state: &ServerState, request: Request) -> Response {
                 Err(e) => Response::error(e.to_string()),
             }
         }
+        Request::GetObjectRange { id, offset, len } => {
+            let objects = state.objects.lock().unwrap();
+            match objects.get_range(id, offset, len as usize) {
+                Ok(data) => Response::GetObjectRange { data },
+                Err(e) => Response::error(e.to_string()),
+            }
+        }
         Request::PutFile { path, data, meta } => {
             let mut objects = state.objects.lock().unwrap();
-            let mut fuse_map = state.fuse_map.lock().unwrap();
 
             match objects.put(&data) {
                 Ok(id) => {
@@ -169,41 +224,81 @@ fn dispatch(state: &ServerState, request: Request) -> Response {
                         entry_type: crate::syncing::proto::EntryType::File,
                         metadata: meta,
                     };
-                    fuse_map.entries.insert(path, entry);
+                    state.fuse_map.insert(path, entry);
                     Response::PutFile { id }
                 }
                 Err(e) => Response::error(e.to_string()),
             }
         }
-        Request::PutFileMeta { path, meta } => {
-            let mut fuse_map = state.fuse_map.lock().unwrap();
+        Request::PatchFile {
+            path,
+            patches,
+            truncate_to,
+            meta,
+        } => {
+            let mut objects = state.objects.lock().unwrap();
+            let Some(existing) = state.fuse_map.get(&path).map(|v| v.clone()) else {
+                return Response::error("File not found");
+            };
 
-            if let Some(entry) = fuse_map.entries.get_mut(&path) {
-                entry.metadata = meta;
-                Response::PutFileMeta
-            } else {
-                Response::error("File not found")
+            let mut bytes = match objects.get(existing.id) {
+                Ok(v) => v,
+                Err(_) => Vec::new(),
+            };
+
+            for patch in patches {
+                let start = patch.offset as usize;
+                let end = start.saturating_add(patch.data.len());
+                if end > bytes.len() {
+                    bytes.resize(end, 0);
+                }
+                bytes[start..end].copy_from_slice(&patch.data);
+            }
+
+            if let Some(sz) = truncate_to {
+                let sz = sz as usize;
+                if sz < bytes.len() {
+                    bytes.truncate(sz);
+                } else if sz > bytes.len() {
+                    bytes.resize(sz, 0);
+                }
+            }
+
+            match objects.put(&bytes) {
+                Ok(id) => {
+                    let entry = crate::syncing::proto::FuseEntry {
+                        id,
+                        entry_type: existing.entry_type,
+                        metadata: meta,
+                    };
+                    state.fuse_map.insert(path, entry);
+                    Response::PatchFile { id }
+                }
+                Err(e) => Response::error(e.to_string()),
             }
         }
+        Request::PutFileMeta { path, meta } => match state.fuse_map.get_mut(&path) {
+            Some(mut entry) => {
+                entry.metadata = meta;
+                Response::PutFileMeta
+            }
+            None => Response::error("File not found"),
+        },
         Request::GetFileMeta { path } => {
-            let fuse_map = state.fuse_map.lock().unwrap();
-            let meta = fuse_map.entries.get(&path).map(|e| e.metadata.clone());
+            let meta = state.fuse_map.get(&path).map(|e| e.metadata.clone());
             Response::GetFileMeta(meta)
         }
         Request::GetEntry { path } => {
-            let fuse_map = state.fuse_map.lock().unwrap();
-            let entry = fuse_map.entries.get(&path).cloned();
+            let entry = state.fuse_map.get(&path).map(|v| v.clone());
             Response::GetEntry(entry)
         }
         Request::DeleteFile { path } => {
-            let mut fuse_map = state.fuse_map.lock().unwrap();
-            fuse_map.entries.remove(&path);
+            state.fuse_map.remove(&path);
             Response::DeleteFile
         }
         Request::RenameFile { from, to } => {
-            let mut fuse_map = state.fuse_map.lock().unwrap();
-            if let Some(entry) = fuse_map.entries.remove(&from) {
-                fuse_map.entries.insert(to, entry);
+            if let Some((_, entry)) = state.fuse_map.remove(&from) {
+                state.fuse_map.insert(to, entry);
                 Response::RenameFile
             } else {
                 Response::error("Source path not found")
@@ -211,7 +306,6 @@ fn dispatch(state: &ServerState, request: Request) -> Response {
         }
         Request::PutDir { path, meta } => {
             let mut objects = state.objects.lock().unwrap();
-            let mut fuse_map = state.fuse_map.lock().unwrap();
 
             match objects.put(&[]) {
                 Ok(id) => {
@@ -228,15 +322,13 @@ fn dispatch(state: &ServerState, request: Request) -> Response {
                             ctime: meta.ctime,
                         },
                     };
-                    fuse_map.entries.insert(path, entry);
+                    state.fuse_map.insert(path, entry);
                     Response::PutDir
                 }
                 Err(e) => Response::error(e.to_string()),
             }
         }
         Request::PutWhiteout { path } => {
-            let mut fuse_map = state.fuse_map.lock().unwrap();
-
             let entry = crate::syncing::proto::FuseEntry {
                 id: 0,
                 entry_type: crate::syncing::proto::EntryType::Whiteout,
@@ -250,23 +342,22 @@ fn dispatch(state: &ServerState, request: Request) -> Response {
                     ctime: 0,
                 },
             };
-            fuse_map.entries.insert(path, entry);
+            state.fuse_map.insert(path, entry);
             Response::PutWhiteout
         }
         Request::ReadDirAll { path } => {
-            let fuse_map = state.fuse_map.lock().unwrap();
-
-            let entries: Vec<_> = fuse_map
-                .entries
+            let entries: Vec<_> = state
+                .fuse_map
                 .iter()
-                .filter(|(p, _)| {
+                .filter(|kv| {
+                    let p = kv.key();
                     // Match entries whose parent equals the requested path.
                     p.parent() == Some(path.as_path())
                         || (path == PathBuf::from("/")
                             && p.parent().is_none()
                             && !p.as_os_str().is_empty())
                 })
-                .map(|(p, e)| (p.clone(), e.clone()))
+                .map(|kv| (kv.key().clone(), kv.value().clone()))
                 .collect();
 
             Response::DirEntries(entries)
@@ -288,7 +379,13 @@ fn dispatch(state: &ServerState, request: Request) -> Response {
                 abi_version: state.abi_version,
                 next_id: state.objects.lock().unwrap().next_id(),
             };
-            let fuse_map = state.fuse_map.lock().unwrap().clone();
+            let fuse_map = FuseMap {
+                entries: state
+                    .fuse_map
+                    .iter()
+                    .map(|kv| (kv.key().clone(), kv.value().clone()))
+                    .collect::<HashMap<_, _>>(),
+            };
 
             if let Err(e) = disk::flush(&state.sandbox_dir, &meta, &fuse_map) {
                 return Response::error(e.to_string());

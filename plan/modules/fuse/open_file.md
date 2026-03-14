@@ -145,6 +145,29 @@ Write data to the open file. **Automatically handles materialization and state p
 
 ---
 
+## Performance Update (v2)
+
+Introduce a sparse dirty state to avoid full-object rewrite on seek+small-write:
+
+```rust
+FileState::FuseOnlyDirtyRanged {
+    object_id: u64,
+    patches: Vec<BytePatch>,
+    truncate_to: Option<u64>,
+    logical_size: u64,
+}
+```
+
+`CowDirty` can continue using tempfile for now, but `FuseOnlyClean` must promote to `FuseOnlyDirtyRanged` on first write.
+
+`read_at` for ranged dirty files composes bytes from:
+1. base object range from daemon (`get_object_range`)
+2. in-memory patches that overlap requested range (patches override base)
+
+`flush_to_daemon` for ranged dirty files sends `PatchFile` instead of full `put_file`.
+
+---
+
 ### tmp_as_file(tmp: &NamedTempFile) -> ManuallyDrop<File>
 
 Helper to get a `File` view of a temp file without taking ownership.

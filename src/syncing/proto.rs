@@ -2,6 +2,12 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BytePatch {
+    pub offset: u64,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMetadata {
     pub size: u64,
     pub mode: u32,
@@ -51,9 +57,20 @@ pub enum Request {
     GetObject {
         id: u64,
     },
+    GetObjectRange {
+        id: u64,
+        offset: u64,
+        len: u32,
+    },
     PutFile {
         path: PathBuf,
         data: Vec<u8>,
+        meta: FileMetadata,
+    },
+    PatchFile {
+        path: PathBuf,
+        patches: Vec<BytePatch>,
+        truncate_to: Option<u64>,
         meta: FileMetadata,
     },
     PutFileMeta {
@@ -95,7 +112,9 @@ pub enum Request {
 pub enum Response {
     PutObject { id: u64 },
     GetObject { data: Vec<u8> },
+    GetObjectRange { data: Vec<u8> },
     PutFile { id: u64 },
+    PatchFile { id: u64 },
     PutFileMeta,
     GetFileMeta(Option<FileMetadata>),
     GetEntry(Option<FuseEntry>),

@@ -2,9 +2,11 @@ Implement `fuse/inode.rs` — `InodeTable`, a bidirectional map between FUSE ino
 
 ## Struct
 
-- ino_to_path: BTreeMap<u64, PathBuf>
-- path_to_ino: BTreeMap<PathBuf, u64>
-- next_ino: u64
+- ino_to_path: DashMap<u64, PathBuf>
+- path_to_ino: DashMap<PathBuf, u64>
+- next_ino: AtomicU64
+
+The table is concurrent and safe for multi-threaded FUSE request handling.
 
 
 ## Notes

@@ -70,7 +70,7 @@ pub fn load(sandbox_dir: &PathBuf) -> Result<(SandboxMeta, FuseMap), DiskError> 
     } else {
         SandboxMeta {
             shm_name: String::new(),
-            abi_version: 1,
+            abi_version: 2,
             next_id: 1,
         }
     };
@@ -124,7 +124,7 @@ pub fn init_sandbox(sandbox_dir: &PathBuf, shm_name: &str) -> Result<(), DiskErr
 
     let meta = SandboxMeta {
         shm_name: shm_name.to_string(),
-        abi_version: 1,
+        abi_version: 2,
         next_id: 1,
     };
     let fuse_map = FuseMap::default();

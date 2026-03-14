@@ -13,7 +13,27 @@ Implement the syncing daemon server — `syncing/server/objects.rs`, `syncing/se
 
 ## Accept Loop
 
-Single-threaded. Writes are serialised; no concurrent handlers needed.
+Multi-threaded request handling:
+
+1. Main thread accepts `UnixStream` connections.
+2. Streams are dispatched to a bounded worker pool sized as `min(4, available_parallelism)`.
+3. Each worker runs `handle_connection` for one stream and serves framed requests until EOF.
+
+## Concurrency and Locking
+
+- Metadata map uses a per-row concurrent hashmap (dashmap).
+- Access log remains a single mutex-guarded file append.
+- Object storage keeps a mutex for object-id allocation and file mutation, while metadata lookups/updates are per-row.
+- Lock ordering rule: never hold metadata row guards while waiting on the object-store mutex.
+
+## Protocol Update (v2)
+
+Server supports partial object/file IO primitives:
+
+- `GetObjectRange { id, offset, len }`
+- `PatchFile { path, patches, truncate_to }`
+
+These are the canonical write path for FUSE dirty ranged files.
 
 ## Shutdown
 
