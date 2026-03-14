@@ -223,6 +223,7 @@ impl CasFuseFs {
         daemon_sock: PathBuf,
         _daemon: SyncClient,
         policy: Arc<dyn Policy>,
+        pool_size: usize,
     ) -> Self {
         let inodes = InodeTable::new(PathBuf::from("/"));
         let mount_uid = nix::unistd::Uid::current().as_raw();
@@ -236,7 +237,7 @@ impl CasFuseFs {
                 logged_once: DashSet::new(),
                 mount_uid,
                 mount_gid,
-                daemon_pool: SyncClientPool::new(daemon_sock, 16),
+                daemon_pool: SyncClientPool::new(daemon_sock, pool_size),
             }),
             policy,
         }

@@ -352,8 +352,14 @@ fn run_fuse_daemon(mountpoint: PathBuf, daemon_socket: PathBuf, policy: Arc<dyn 
         }
     };
 
-    let fuse_fs =
-        crate::fuse::CasFuseFs::new(PathBuf::from("/"), daemon_socket.clone(), daemon, policy);
+    let pool_cap = crate::syncing::server::default_worker_count();
+    let fuse_fs = crate::fuse::CasFuseFs::new(
+        PathBuf::from("/"),
+        daemon_socket.clone(),
+        daemon,
+        policy,
+        pool_cap,
+    );
 
     if let Err(e) = crate::fuse::run_fuse(fuse_fs, &mountpoint) {
         log::error!(

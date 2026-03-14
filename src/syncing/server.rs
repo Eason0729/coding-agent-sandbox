@@ -18,6 +18,24 @@ use crate::syncing::proto::{Request, Response};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 
+pub fn default_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_worker_count;
+
+    #[test]
+    fn default_worker_count_is_bounded() {
+        let n = default_worker_count();
+        assert!((1..=4).contains(&n));
+    }
+}
+
 /// Mutable server state shared across worker threads.
 ///
 /// This state intentionally separates high-contention data:
@@ -246,11 +264,7 @@ pub fn run<P: PollLock>(sandbox_dir: PathBuf, ready: impl FnOnce(), poll_lock: &
     ready();
     log::info!("sync.start event=ready socket={}", sock_path.display());
 
-    let thread_count = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(4)
-        .max(1);
+    let thread_count = default_worker_count();
     log::debug!("sync.start event=workers count={thread_count}");
 
     let (tx, rx) = mpsc::channel::<UnixStream>();
