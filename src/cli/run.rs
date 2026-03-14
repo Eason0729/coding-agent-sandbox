@@ -1,23 +1,26 @@
+use std::ffi::CString;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use log;
-use nix::sys::wait::waitpid;
-use nix::sys::wait::WaitPidFlag;
-use nix::sys::wait::WaitStatus;
-use nix::unistd::{fork, ForkResult};
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+use nix::unistd::{fork, ForkResult, Pid};
 use thiserror::Error;
 
 use crate::config::{Config, ConfigPolicy};
+use crate::fuse::policy::Policy;
 use crate::isolate::seccomp::apply_seccomp_filter;
 use crate::isolate::stage1::create_user_ns;
 use crate::isolate::stage2::{create_mount_ns, drop_capabilities, prepare_chroot};
 use crate::shm::ShmState;
 use crate::syncing::server::PollLock;
 use crate::syncing::SyncClient;
+
+const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(15);
+const FUSE_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 pub type Result<T> = std::result::Result<T, RunError>;
 
@@ -49,25 +52,126 @@ pub enum RunError {
     DaemonNotReady(String),
     #[error("FUSE mount failed: {0}")]
     FuseMountFailed(String),
+    #[error("command argument contains NUL byte")]
+    InvalidCommandArg,
 }
 
-/// Poll the mountpoint until a different filesystem is mounted there (i.e.
-/// the FUSE daemon has completed its mount).  We detect this by comparing
-/// the device number of the mountpoint against its parent: once FUSE mounts,
-/// the kernel assigns a new device number to the mountpoint.
-fn wait_for_fuse_ready(mountpoint: &Path, fuse_child: nix::unistd::Pid) -> Result<()> {
+/// Immutable runtime inputs used by `cmd_run` once configuration loading succeeds.
+struct RunContext {
+    project_root: PathBuf,
+    daemon_socket: PathBuf,
+    shm: ShmState,
+    policy: Arc<dyn Policy>,
+}
+
+/// Transient payload used by setup(1)/setup(2) and FUSE child processes.
+struct SetupPayload {
+    rootfs: PathBuf,
+    mountpoint: PathBuf,
+    cwd: PathBuf,
+    daemon_socket: PathBuf,
+    cmd_argv: Vec<String>,
+    policy: Arc<dyn Policy>,
+}
+
+/// RAII lease for the `running_count` slot.
+///
+/// The lease is armed after incrementing `running_count`. If any early-return error
+/// happens before the explicit success-path decrement, dropping this lease will perform
+/// the decrement under SHM lock and avoid leaked run slots.
+struct RunningCountLease<'a> {
+    shm: &'a ShmState,
+    armed: bool,
+}
+
+impl<'a> RunningCountLease<'a> {
+    fn new(shm: &'a ShmState) -> Self {
+        Self { shm, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RunningCountLease<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        log::warn!("run.lifecycle event=rollback_decrement reason=drop_guard");
+        let mut guard = unsafe { self.shm.lock() };
+        guard.decrement();
+    }
+}
+
+/// SHM-backed implementation of daemon shutdown polling.
+///
+/// The key property is lock ownership during shutdown transition:
+/// 1. Acquire SHM mutex.
+/// 2. Observe `running_count == 0`.
+/// 3. Set `socket_ready = 0`.
+/// 4. Execute server shutdown callback while lock is still held.
+///
+/// This removes the transition gap where a new runner could race in while an old
+/// daemon is still in the middle of teardown.
+struct ShmPollLock<'a> {
+    shm: &'a ShmState,
+    last_check: Instant,
+}
+
+impl<'a> ShmPollLock<'a> {
+    fn new(shm: &'a ShmState) -> Self {
+        Self {
+            shm,
+            last_check: Instant::now(),
+        }
+    }
+}
+
+impl PollLock for ShmPollLock<'_> {
+    fn poll_shutdown<F>(&mut self, on_shutdown: F) -> bool
+    where
+        F: FnOnce(),
+    {
+        if self.last_check.elapsed() < SHUTDOWN_POLL_INTERVAL {
+            return false;
+        }
+
+        self.last_check = Instant::now();
+
+        let mut guard = unsafe { self.shm.lock() };
+        let running = guard.get_running_count();
+        log::debug!("sync.lifecycle event=poll running_count={running}");
+
+        if running != 0 {
+            return false;
+        }
+
+        log::info!("sync.lifecycle event=shutdown_begin reason=running_count_zero");
+        guard.set_socket_ready(false);
+        on_shutdown();
+        log::info!("sync.lifecycle event=shutdown_complete");
+        true
+    }
+}
+
+/// Poll mountpoint readiness and fail fast on early FUSE daemon death.
+fn wait_for_fuse_ready(mountpoint: &Path, fuse_child: Pid) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
+
     let parent_dev = mountpoint
         .parent()
         .and_then(|p| std::fs::metadata(p).ok())
         .map(|m| m.dev())
         .unwrap_or(u64::MAX);
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + FUSE_READY_TIMEOUT;
 
     loop {
         if let Ok(meta) = std::fs::metadata(mountpoint) {
             if meta.dev() != parent_dev {
+                log::debug!("run.fuse event=ready mountpoint={}", mountpoint.display());
                 return Ok(());
             }
         }
@@ -101,12 +205,15 @@ fn wait_for_fuse_ready(mountpoint: &Path, fuse_child: nix::unistd::Pid) -> Resul
                 "timeout waiting for FUSE mount".to_string(),
             ));
         }
+
         std::thread::sleep(Duration::from_millis(50));
     }
 }
 
+/// Wait until shared-state and socket probe both indicate daemon readiness.
 fn wait_for_daemon_ready(shm: &ShmState, daemon_socket: &Path, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
+
     loop {
         let socket_ready = {
             let guard = unsafe { shm.lock() };
@@ -114,6 +221,10 @@ fn wait_for_daemon_ready(shm: &ShmState, daemon_socket: &Path, timeout: Duration
         };
 
         if socket_ready && UnixStream::connect(daemon_socket).is_ok() {
+            log::info!(
+                "run.lifecycle event=daemon_ready socket={}",
+                daemon_socket.display()
+            );
             return Ok(());
         }
 
@@ -123,236 +234,243 @@ fn wait_for_daemon_ready(shm: &ShmState, daemon_socket: &Path, timeout: Duration
                 daemon_socket.display()
             )));
         }
+
         std::thread::sleep(Duration::from_millis(10));
     }
 }
 
-struct RunningCountGuard<'a> {
-    shm: &'a ShmState,
-    armed: bool,
-}
-
-impl<'a> RunningCountGuard<'a> {
-    fn new(shm: &'a ShmState) -> Self {
-        Self { shm, armed: true }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for RunningCountGuard<'_> {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let mut guard = unsafe { self.shm.lock() };
-        guard.decrement();
-    }
-}
-
-struct ShmPollLock<'a> {
-    shm: &'a ShmState,
-    last_check: Instant,
-}
-
-impl<'a> ShmPollLock<'a> {
-    fn new(shm: &'a ShmState) -> Self {
-        Self {
-            shm,
-            last_check: Instant::now(),
-        }
-    }
-}
-
-impl PollLock for ShmPollLock<'_> {
-    fn poll_shutdown<F>(&mut self, on_shutdown: F) -> bool
-    where
-        F: FnOnce(),
-    {
-        if self.last_check.elapsed() < Duration::from_secs(1) {
-            return false;
-        }
-
-        let mut guard = unsafe { self.shm.lock() };
-        if guard.get_running_count() != 0 {
-            drop(guard);
-            self.last_check = Instant::now();
-            return false;
-        }
-
-        guard.set_socket_ready(false);
-        on_shutdown();
-        true
-    }
-}
-
-pub fn cmd_run(project_root: &Path, cmd_args: &[String]) -> Result<()> {
-    if cmd_args.is_empty() {
-        return Err(RunError::NoCommand);
-    }
-
+/// Load all run-time inputs (metadata, policy, shared memory, socket paths).
+fn prepare_context(project_root: &Path) -> Result<RunContext> {
     let sandbox_dir = project_root.join(".sandbox");
     if !sandbox_dir.exists() {
         return Err(RunError::NotInitialized);
     }
 
-    // 1. Load metadata to get shm_name
     let (meta, _fuse_map) = crate::syncing::disk::load(&project_root.to_path_buf())?;
+    let policy = build_policy(project_root, &sandbox_dir)?;
 
-    // 2. Load config and build policy
-    let config_path = sandbox_dir.join("config.toml");
-    let config = Config::from_file(&config_path)?;
-    let policy = ConfigPolicy::from_config(&config, project_root)
-        .map_err(|e| RunError::Policy(e.to_string()))?;
-    let policy: Arc<dyn crate::fuse::policy::Policy> = Arc::new(policy);
-
-    // 3. Open or create the POSIX SHM segment
     let shm = match ShmState::open(&meta.shm_name) {
         Ok(s) => s,
         Err(_) => ShmState::create(&meta.shm_name)?,
     };
 
-    let daemon_socket = sandbox_dir.join("daemon.sock");
+    Ok(RunContext {
+        project_root: project_root.to_path_buf(),
+        daemon_socket: sandbox_dir.join("daemon.sock"),
+        shm,
+        policy,
+    })
+}
 
-    let mut guard = unsafe { shm.lock() };
-    let was_running = guard.increment();
+/// Build policy object from `.sandbox/config.toml`.
+fn build_policy(project_root: &Path, sandbox_dir: &Path) -> Result<Arc<dyn Policy>> {
+    let config_path = sandbox_dir.join("config.toml");
+    let config = Config::from_file(&config_path)?;
+    let policy = ConfigPolicy::from_config(&config, project_root)
+        .map_err(|e| RunError::Policy(e.to_string()))?;
+    Ok(Arc::new(policy))
+}
 
-    let mut running_guard = RunningCountGuard::new(&shm);
+/// Enter run lifecycle:
+/// - increment `running_count` under lock,
+/// - start syncing daemon on 0->1 without lock gap,
+/// - wait until daemon is externally reachable.
+fn enter_run_lifecycle(ctx: &RunContext) -> Result<RunningCountLease<'_>> {
+    let mut guard = unsafe { ctx.shm.lock() };
+    let previous = guard.increment();
 
-    if was_running == 0 {
+    log::info!("run.lifecycle event=increment previous={previous}");
+
+    let lease = RunningCountLease::new(&ctx.shm);
+    if previous == 0 {
+        log::info!("run.lifecycle event=daemon_start_begin");
         guard.set_socket_ready(false);
-        let poll_lock = ShmPollLock::new(&shm);
-        crate::syncing::server::fork_and_run(project_root.to_path_buf(), poll_lock, move || {
-            drop(guard)
+
+        let poll_lock = ShmPollLock::new(&ctx.shm);
+        crate::syncing::server::fork_and_run(ctx.project_root.clone(), poll_lock, move || {
+            guard.set_socket_ready(true);
+            log::info!("run.lifecycle event=daemon_start_committed socket_ready=1");
+            drop(guard);
         })
         .map_err(RunError::Fork)?;
     } else {
         drop(guard);
     }
 
-    wait_for_daemon_ready(&shm, &daemon_socket, Duration::from_secs(15))?;
+    wait_for_daemon_ready(&ctx.shm, &ctx.daemon_socket, DAEMON_READY_TIMEOUT)?;
+    Ok(lease)
+}
 
-    // 6. Create a temporary rootfs and mountpoint
-    let rootfs = tempfile::tempdir()?;
-    let rootfs_path = rootfs.path().to_path_buf();
-    let mountpoint = tempfile::tempdir()?;
-    let mountpoint_path = mountpoint.path().to_path_buf();
+/// Leave run lifecycle by decrementing `running_count` under lock.
+fn leave_run_lifecycle(shm: &ShmState) {
+    let mut guard = unsafe { shm.lock() };
+    guard.decrement();
+    log::info!("run.lifecycle event=decrement");
+}
 
-    let cwd = std::env::current_dir().unwrap_or_else(|_| project_root.to_path_buf());
+/// Spawn setup(1) process and return its PID in the parent.
+fn spawn_setup_process(payload: SetupPayload) -> Result<Pid> {
+    match unsafe { fork() } {
+        Ok(ForkResult::Parent { child }) => Ok(child),
+        Ok(ForkResult::Child) => run_setup_stage1(payload),
+        Err(e) => Err(RunError::Fork(e)),
+    }
+}
 
-    let cmd_program = cmd_args[0].clone();
-    let cmd_argv: Vec<String> = cmd_args.to_vec();
-    let daemon_socket_clone = daemon_socket.clone();
-    let policy_clone = Arc::clone(&policy);
-    // 7. Second fork: setup(1) process
-    let child_pid = match unsafe { fork() } {
-        Ok(ForkResult::Child) => {
-            // setup(1): create user namespace and mount namespace
-            if let Err(e) = create_user_ns() {
-                log::error!("setup(1): failed to create user ns: {}", e);
-                std::process::exit(1);
-            }
-            if let Err(e) = create_mount_ns() {
-                log::error!("setup(1): failed to create mount ns: {}", e);
-                std::process::exit(1);
-            }
+/// setup(1): create namespaces, then fork into FUSE daemon + setup(2).
+fn run_setup_stage1(payload: SetupPayload) -> ! {
+    if let Err(e) = create_user_ns() {
+        log::error!("setup1 event=user_ns_failed error={e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = create_mount_ns() {
+        log::error!("setup1 event=mount_ns_failed error={e}");
+        std::process::exit(1);
+    }
 
-            // Third fork: FUSE daemon vs setup(2)
-            match unsafe { fork() } {
-                Ok(ForkResult::Child) => {
-                    // FUSE daemon process
-                    let daemon = match SyncClient::connect(&daemon_socket_clone) {
-                        Ok(d) => d,
-                        Err(e) => {
-                            log::error!("FUSE daemon: failed to connect to syncing daemon: {}", e);
-                            std::process::exit(1);
-                        }
-                    };
-
-                    // FUSE root is "/" — the entire host filesystem is served through
-                    // FUSE so the sandboxed process sees a complete root tree.
-                    let fuse_fs = crate::fuse::CasFuseFs::new(
-                        std::path::PathBuf::from("/"),
-                        daemon_socket_clone.clone(),
-                        daemon,
-                        policy_clone,
-                    );
-
-                    if let Err(e) = crate::fuse::run_fuse(fuse_fs, &mountpoint_path) {
-                        log::error!("FUSE daemon: run_fuse error: {}", e);
-                        std::process::exit(1);
-                    }
-                    std::process::exit(0);
-                }
-                Ok(ForkResult::Parent { child: fuse_child }) => {
-                    // setup(2): wait for FUSE to be ready, then chroot + exec
-                    if let Err(e) = wait_for_fuse_ready(&mountpoint_path, fuse_child) {
-                        log::error!("setup(2): wait_for_fuse_ready failed: {}", e);
-                        std::process::exit(1);
-                    }
-
-                    if let Err(e) = prepare_chroot(&rootfs_path, &mountpoint_path, &cwd) {
-                        log::error!("setup(2): prepare_chroot failed: {}", e);
-                        std::process::exit(1);
-                    }
-
-                    if let Err(e) = apply_seccomp_filter() {
-                        log::error!("setup(2): seccomp failed: {}", e);
-                        std::process::exit(1);
-                    }
-
-                    if let Err(e) = drop_capabilities() {
-                        log::error!("setup(2): drop_capabilities failed: {}", e);
-                        std::process::exit(1);
-                    }
-
-                    // exec the command
-                    let program = std::ffi::CString::new(cmd_program.as_str()).unwrap();
-                    let args: Vec<std::ffi::CString> = cmd_argv
-                        .iter()
-                        .map(|s| std::ffi::CString::new(s.as_str()).unwrap())
-                        .collect();
-
-                    let _ = nix::unistd::execvp(&program, &args);
-                    log::error!("execvp failed");
-                    std::process::exit(1);
-                }
-                Err(e) => {
-                    log::error!("setup(1): fork for FUSE daemon failed: {}", e);
-                    std::process::exit(1);
-                }
-            }
+    match unsafe { fork() } {
+        Ok(ForkResult::Child) => run_fuse_daemon(
+            payload.mountpoint.clone(),
+            payload.daemon_socket.clone(),
+            Arc::clone(&payload.policy),
+        ),
+        Ok(ForkResult::Parent { child: fuse_child }) => run_setup_stage2(payload, fuse_child),
+        Err(e) => {
+            log::error!("setup1 event=fork_fuse_failed error={e}");
+            std::process::exit(1);
         }
-        Ok(ForkResult::Parent { child }) => child,
-        Err(e) => return Err(RunError::Fork(e)),
+    }
+}
+
+/// FUSE child: connect daemon client and serve mount loop.
+fn run_fuse_daemon(mountpoint: PathBuf, daemon_socket: PathBuf, policy: Arc<dyn Policy>) -> ! {
+    let daemon = match SyncClient::connect(&daemon_socket) {
+        Ok(d) => d,
+        Err(e) => {
+            log::error!("fuse.child event=daemon_connect_failed error={e}");
+            std::process::exit(1);
+        }
     };
 
-    // Parent: wait for setup(1) to finish
-    let exit_code = match waitpid(child_pid, None) {
+    let fuse_fs =
+        crate::fuse::CasFuseFs::new(PathBuf::from("/"), daemon_socket.clone(), daemon, policy);
+
+    if let Err(e) = crate::fuse::run_fuse(fuse_fs, &mountpoint) {
+        log::error!(
+            "fuse.child event=run_failed mountpoint={} error={e}",
+            mountpoint.display()
+        );
+        std::process::exit(1);
+    }
+
+    std::process::exit(0);
+}
+
+/// setup(2): wait FUSE mount, prepare chroot, apply hardening, exec target command.
+fn run_setup_stage2(payload: SetupPayload, fuse_child: Pid) -> ! {
+    if let Err(e) = wait_for_fuse_ready(&payload.mountpoint, fuse_child) {
+        log::error!("setup2 event=fuse_not_ready error={e}");
+        std::process::exit(1);
+    }
+
+    if let Err(e) = prepare_chroot(&payload.rootfs, &payload.mountpoint, &payload.cwd) {
+        log::error!("setup2 event=prepare_chroot_failed error={e}");
+        std::process::exit(1);
+    }
+
+    if let Err(e) = apply_seccomp_filter() {
+        log::error!("setup2 event=seccomp_failed error={e}");
+        std::process::exit(1);
+    }
+
+    if let Err(e) = drop_capabilities() {
+        log::error!("setup2 event=drop_caps_failed error={e}");
+        std::process::exit(1);
+    }
+
+    if exec_command(&payload.cmd_argv).is_err() {
+        std::process::exit(1);
+    }
+
+    std::process::exit(1);
+}
+
+/// Execute target command with `execvp` (never returns on success).
+fn exec_command(argv: &[String]) -> Result<()> {
+    let Some(program) = argv.first() else {
+        return Err(RunError::NoCommand);
+    };
+
+    let program = CString::new(program.as_str()).map_err(|_| RunError::InvalidCommandArg)?;
+    let mut args = Vec::with_capacity(argv.len());
+    for arg in argv {
+        args.push(CString::new(arg.as_str()).map_err(|_| RunError::InvalidCommandArg)?);
+    }
+
+    match nix::unistd::execvp(&program, &args) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            log::error!("setup2 event=exec_failed error={e}");
+            Err(RunError::Io(std::io::Error::other(e.to_string())))
+        }
+    }
+}
+
+/// Wait for setup(1) completion and normalize process status into exit code.
+fn wait_setup_exit(child_pid: Pid) -> i32 {
+    match waitpid(child_pid, None) {
         Ok(WaitStatus::Exited(_, code)) => code,
         Ok(WaitStatus::Signaled(_, sig, _)) => {
-            log::error!("child killed by signal: {}", sig);
+            log::error!("run.child event=signaled signal={sig}");
             1
         }
         Ok(_) => 0,
         Err(e) => {
-            log::error!("waitpid error: {}", e);
+            log::error!("run.child event=wait_failed error={e}");
             1
         }
+    }
+}
+
+/// Build temp rootfs/mountpoint, run setup flow, and return target command exit code.
+fn run_in_sandbox(ctx: &RunContext, cmd_args: &[String]) -> Result<i32> {
+    let rootfs = tempfile::tempdir()?;
+    let mountpoint = tempfile::tempdir()?;
+
+    let payload = SetupPayload {
+        rootfs: rootfs.path().to_path_buf(),
+        mountpoint: mountpoint.path().to_path_buf(),
+        cwd: std::env::current_dir().unwrap_or_else(|_| ctx.project_root.clone()),
+        daemon_socket: ctx.daemon_socket.clone(),
+        cmd_argv: cmd_args.to_vec(),
+        policy: Arc::clone(&ctx.policy),
     };
 
-    // 8. Decrement running_count
-    running_guard.disarm();
-    {
-        let mut guard = unsafe { shm.lock() };
-        guard.decrement();
+    let child_pid = spawn_setup_process(payload)?;
+    Ok(wait_setup_exit(child_pid))
+}
+
+/// Entry point for `cas run`.
+///
+/// The function intentionally follows lifecycle stages with explicit logs:
+/// 1. prepare context
+/// 2. enter run lifecycle + daemon readiness
+/// 3. launch isolated process tree
+/// 4. leave run lifecycle and forward exit code
+pub fn cmd_run(project_root: &Path, cmd_args: &[String]) -> Result<()> {
+    if cmd_args.is_empty() {
+        return Err(RunError::NoCommand);
     }
 
-    // Drop tempdir handles (unmounts happen automatically on drop for FUSE with AutoUnmount)
-    drop(rootfs);
-    drop(mountpoint);
+    let ctx = prepare_context(project_root)?;
+    log::info!("run.lifecycle event=begin root={}", project_root.display());
 
+    let mut lease = enter_run_lifecycle(&ctx)?;
+    let exit_code = run_in_sandbox(&ctx, cmd_args)?;
+
+    lease.disarm();
+    leave_run_lifecycle(&ctx.shm);
+
+    log::info!("run.lifecycle event=end exit_code={exit_code}");
     std::process::exit(exit_code);
 }

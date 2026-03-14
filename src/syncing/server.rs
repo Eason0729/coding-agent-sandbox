@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -16,6 +16,14 @@ use crate::syncing::disk::{self, AccessLog, FuseMap, SandboxMeta};
 use crate::syncing::object::ObjectStore;
 use crate::syncing::proto::{Request, Response};
 
+const READY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Mutable server state shared across worker threads.
+///
+/// This state intentionally separates high-contention data:
+/// - object store mutations behind one mutex,
+/// - path map in `DashMap` for concurrent row access,
+/// - append-only access log behind one mutex.
 pub struct ServerState {
     pub objects: Mutex<ObjectStore>,
     pub fuse_map: DashMap<PathBuf, crate::syncing::proto::FuseEntry>,
@@ -25,6 +33,11 @@ pub struct ServerState {
     pub abi_version: u32,
 }
 
+/// Shutdown polling contract owned by `run.rs`.
+///
+/// The syncing daemon does not know SHM details. It only asks whether shutdown
+/// should happen; if yes, the caller executes server-finalization callback while
+/// preserving its own lock/transition invariants.
 pub trait PollLock {
     fn poll_shutdown<F>(&mut self, on_shutdown: F) -> bool
     where
@@ -38,23 +51,28 @@ where
     F: FnOnce(),
 {
     let (mut parent_sock, mut child_sock) = UnixStream::pair().map_err(|_| Errno::EIO)?;
+    parent_sock.set_nonblocking(true).map_err(|_| Errno::EIO)?;
 
     match unsafe { fork() }? {
         ForkResult::Parent { child } => {
             drop(child_sock);
 
-            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            let deadline = std::time::Instant::now() + READY_TIMEOUT;
             let mut ready = [0u8; 1];
+            log::debug!("sync.start event=parent_wait_ready");
 
             loop {
-                match parent_sock.read_exact(&mut ready) {
-                    Ok(()) => {
+                match parent_sock.read(&mut ready) {
+                    Ok(1) => {
+                        log::debug!("sync.start event=ready_signal_received");
                         on_ready();
                         return Ok(());
                     }
+                    Ok(0) => return Err(Errno::EPIPE),
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(_) => return Err(Errno::EIO),
+                    _ => {}
                 }
 
                 match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
@@ -85,6 +103,7 @@ where
     Ok(())
 }
 
+/// Build a flush snapshot from concurrent in-memory structures.
 fn snapshot_state(state: &ServerState) -> (SandboxMeta, FuseMap) {
     let meta = SandboxMeta {
         shm_name: state.shm_name.clone(),
@@ -101,76 +120,49 @@ fn snapshot_state(state: &ServerState) -> (SandboxMeta, FuseMap) {
     (meta, fuse_map)
 }
 
-pub fn run<P: PollLock>(sandbox_dir: PathBuf, ready: impl FnOnce(), poll_lock: &mut P) {
-    let (meta, fuse_map) = match disk::load(&sandbox_dir) {
-        Ok(m) => m,
-        Err(e) => {
-            log::error!("Failed to load metadata: {}", e);
-            std::process::exit(1);
-        }
-    };
+/// Load persisted state and build in-memory daemon structures.
+fn build_server_state(sandbox_dir: &Path) -> std::result::Result<Arc<ServerState>, String> {
+    let (meta, fuse_map) = disk::load(&sandbox_dir.to_path_buf()).map_err(|e| e.to_string())?;
 
     let objects_dir = sandbox_dir.join(".sandbox").join("data").join("objects");
     let object_store = ObjectStore::new(objects_dir, meta.next_id);
 
     let log_path = sandbox_dir.join(".sandbox").join("data").join("access.log");
-    let access_log = match AccessLog::open(&log_path) {
-        Ok(log) => log,
-        Err(e) => {
-            log::error!("Failed to open access log: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let access_log = AccessLog::open(&log_path).map_err(|e| e.to_string())?;
 
-    let state = Arc::new(ServerState {
+    Ok(Arc::new(ServerState {
         objects: Mutex::new(object_store),
         fuse_map: DashMap::from_iter(fuse_map.entries),
         access_log: Mutex::new(access_log),
-        sandbox_dir: sandbox_dir.clone(),
-        shm_name: meta.shm_name.clone(),
+        sandbox_dir: sandbox_dir.to_path_buf(),
+        shm_name: meta.shm_name,
         abi_version: meta.abi_version,
-    });
+    }))
+}
 
-    let sock_path = sandbox_dir.join(".sandbox").join("daemon.sock");
+/// Bind daemon socket and apply socket file permissions.
+fn bind_listener(sock_path: &Path) -> std::io::Result<UnixListener> {
     if let Some(parent) = sock_path.parent() {
-        std::fs::create_dir_all(parent).expect("Failed to create daemon socket directory");
+        std::fs::create_dir_all(parent)?;
     }
+    let _ = std::fs::remove_file(sock_path);
 
-    // Remove a stale socket file left by a previous crashed run so that
-    // UnixListener::bind does not fail with EADDRINUSE.
-    let _ = std::fs::remove_file(&sock_path);
-
-    let listener = match UnixListener::bind(&sock_path) {
-        Ok(l) => l,
-        Err(e) => {
-            log::error!("Failed to bind socket: {}", e);
-            std::process::exit(1);
-        }
-    };
-
+    let listener = UnixListener::bind(sock_path)?;
     std::fs::set_permissions(
-        &sock_path,
+        sock_path,
         std::os::unix::fs::PermissionsExt::from_mode(0o600),
-    )
-    .expect("Failed to set socket permissions");
+    )?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+}
 
-    ready();
-
-    if let Err(e) = listener.set_nonblocking(true) {
-        log::error!("Failed to set daemon listener nonblocking: {}", e);
-        std::process::exit(1);
-    }
-
-    let thread_count = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(4)
-        .max(1);
-
-    let (tx, rx) = mpsc::channel::<UnixStream>();
-    let rx = Arc::new(Mutex::new(rx));
+/// Spawn bounded request workers that each serve one connection at a time.
+fn spawn_workers(
+    state: Arc<ServerState>,
+    rx: Arc<Mutex<mpsc::Receiver<UnixStream>>>,
+    thread_count: usize,
+) -> Vec<thread::JoinHandle<()>> {
     let mut workers = Vec::with_capacity(thread_count);
-
     for _ in 0..thread_count {
         let state_ref = Arc::clone(&state);
         let rx_ref = Arc::clone(&rx);
@@ -179,57 +171,111 @@ pub fn run<P: PollLock>(sandbox_dir: PathBuf, ready: impl FnOnce(), poll_lock: &
                 let guard = rx_ref.lock().unwrap();
                 guard.recv()
             };
+
             let Ok(stream) = stream else {
                 break;
             };
+
             if let Err(e) = handle_connection(state_ref.as_ref(), stream) {
-                log::error!("Connection error: {}", e);
+                log::error!("sync.conn event=serve_failed error={e}");
             }
         }));
     }
+    workers
+}
 
-    let mut should_shutdown = false;
+/// Finalize daemon state and remove socket path.
+fn flush_and_remove_socket(state: &ServerState, sock_path: &Path) {
+    let (meta, fuse_map) = snapshot_state(state);
+    if let Err(e) = disk::flush(&state.sandbox_dir, &meta, &fuse_map) {
+        log::error!("sync.lifecycle event=flush_failed error={e}");
+    }
+    let _ = std::fs::remove_file(sock_path);
+}
+
+/// Accept loop with delegated shutdown decision.
+fn run_accept_loop<P: PollLock>(
+    listener: &UnixListener,
+    tx: &mpsc::Sender<UnixStream>,
+    state: &Arc<ServerState>,
+    sock_path: &Path,
+    poll_lock: &mut P,
+) -> bool {
     loop {
         match listener.accept() {
-            Ok((stream, _addr)) => {
+            Ok((stream, _)) => {
                 let _ = tx.send(stream);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(10));
             }
             Err(e) => {
-                log::error!("Accept error: {}", e);
-                break;
+                log::error!("sync.accept event=error error={e}");
+                return false;
             }
         }
 
-        if poll_lock.poll_shutdown(|| {
-            let (meta, fuse_map) = snapshot_state(state.as_ref());
-            if let Err(e) = disk::flush(&state.as_ref().sandbox_dir, &meta, &fuse_map) {
-                log::error!("Failed to flush metadata: {}", e);
-            }
-            let _ = std::fs::remove_file(&sock_path);
-        }) {
-            should_shutdown = true;
-            break;
+        if poll_lock.poll_shutdown(|| flush_and_remove_socket(state.as_ref(), sock_path)) {
+            return true;
         }
     }
+}
+
+/// Main daemon loop for the syncing process.
+pub fn run<P: PollLock>(sandbox_dir: PathBuf, ready: impl FnOnce(), poll_lock: &mut P) {
+    let state = match build_server_state(&sandbox_dir) {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("sync.start event=state_init_failed error={e}");
+            std::process::exit(1);
+        }
+    };
+
+    let sock_path = sandbox_dir.join(".sandbox").join("daemon.sock");
+    let listener = match bind_listener(&sock_path) {
+        Ok(l) => l,
+        Err(e) => {
+            log::error!(
+                "sync.start event=bind_failed socket={} error={e}",
+                sock_path.display()
+            );
+            std::process::exit(1);
+        }
+    };
+
+    ready();
+    log::info!("sync.start event=ready socket={}", sock_path.display());
+
+    let thread_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(4)
+        .max(1);
+    log::debug!("sync.start event=workers count={thread_count}");
+
+    let (tx, rx) = mpsc::channel::<UnixStream>();
+    let rx = Arc::new(Mutex::new(rx));
+    let workers = spawn_workers(Arc::clone(&state), Arc::clone(&rx), thread_count);
+
+    let shutdown_committed = run_accept_loop(&listener, &tx, &state, &sock_path, poll_lock);
 
     drop(tx);
     for worker in workers {
         let _ = worker.join();
     }
 
-    if !should_shutdown {
-        let (meta, fuse_map) = snapshot_state(state.as_ref());
-        if let Err(e) = disk::flush(&state.as_ref().sandbox_dir, &meta, &fuse_map) {
-            log::error!("Failed to flush metadata: {}", e);
-        }
-        let _ = std::fs::remove_file(&sock_path);
+    if !shutdown_committed {
+        flush_and_remove_socket(state.as_ref(), &sock_path);
     }
 
     std::process::exit(0);
 }
+
+/// Serve framed request/response traffic for one connected client.
+///
+/// Protocol framing: little-endian u32 length prefix followed by postcard payload.
+/// The loop exits cleanly on EOF and propagates parse/IO errors to the caller,
+/// which logs and drops the connection.
 fn handle_connection(
     state: &ServerState,
     mut stream: UnixStream,
@@ -260,8 +306,13 @@ fn handle_connection(
     Ok(())
 }
 
+/// Dispatch one typed request into state mutations and typed response.
+///
+/// The dispatcher never panics on malformed protocol-level operations; recoverable
+/// failures are mapped to `Response::Error` so clients get explicit failures.
 fn dispatch(state: &ServerState, request: Request) -> Response {
     match request {
+        // Object API
         Request::PutObject { data } => {
             let mut objects = state.objects.lock().unwrap();
             match objects.put(&data) {
@@ -283,6 +334,8 @@ fn dispatch(state: &ServerState, request: Request) -> Response {
                 Err(e) => Response::error(e.to_string()),
             }
         }
+
+        // File/object metadata API
         Request::PutFile { path, data, meta } => {
             let mut objects = state.objects.lock().unwrap();
 
@@ -346,6 +399,8 @@ fn dispatch(state: &ServerState, request: Request) -> Response {
                 Err(e) => Response::error(e.to_string()),
             }
         }
+
+        // Namespace mutation API
         Request::PutFileMeta { path, meta } => match state.fuse_map.get_mut(&path) {
             Some(mut entry) => {
                 entry.metadata = meta;
@@ -373,6 +428,8 @@ fn dispatch(state: &ServerState, request: Request) -> Response {
                 Response::error("Source path not found")
             }
         }
+
+        // Directory/whiteout API
         Request::PutDir { path, meta } => {
             let mut objects = state.objects.lock().unwrap();
 
@@ -414,6 +471,8 @@ fn dispatch(state: &ServerState, request: Request) -> Response {
             state.fuse_map.insert(path, entry);
             Response::PutWhiteout
         }
+
+        // Enumeration/logging/flush API
         Request::ReadDirAll { path } => {
             let entries: Vec<_> = state
                 .fuse_map
