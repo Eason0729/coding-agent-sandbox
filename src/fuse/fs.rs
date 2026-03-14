@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -1762,5 +1763,186 @@ impl Filesystem for CasFuseFs {
         // tcl use it: /usr/bin/tclsh9.0
 
         reply.error(Errno::ENOTSUP);
+    }
+
+    fn fallocate(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        length: u64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        let mut g = self.lock();
+        if g.path_of(ino).is_none() {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+
+        let mut of = match g.open_files.remove(&fh.0) {
+            Some(v) => v,
+            None => {
+                reply.error(Errno::EBADF);
+                return;
+            }
+        };
+
+        let root = g.root.clone();
+        let res = match &mut of.state {
+            FileState::Passthrough { file } => {
+                let fd = file.as_raw_fd();
+                let ret = unsafe {
+                    libc::fallocate(fd, mode, offset as libc::off_t, length as libc::off_t)
+                };
+                if ret == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or(libc::EIO))
+                }
+            }
+            FileState::CowDirty { tmp, .. }
+            | FileState::FuseOnlyDirty { tmp, .. }
+            | FileState::FuseOnlyNew { tmp } => {
+                use std::io::{Seek, SeekFrom, Write};
+                let mut file = tmp_as_file(tmp);
+                let end = offset.saturating_add(length);
+                let current_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+                if end > current_size {
+                    let mode_keep_size = mode & libc::FALLOC_FL_KEEP_SIZE as i32;
+                    if mode_keep_size == 0 {
+                        match file.seek(SeekFrom::Start(end)) {
+                            Ok(_) => {}
+                            Err(e) => {
+                                g.open_files.insert(fh.0, of);
+                                reply.error(errno(io_errno(&e)));
+                                return;
+                            }
+                        }
+                        match file.write_all(&[0]) {
+                            Ok(_) => {}
+                            Err(e) => {
+                                g.open_files.insert(fh.0, of);
+                                reply.error(errno(io_errno(&e)));
+                                return;
+                            }
+                        }
+                    } else {
+                        let diff = end - current_size;
+                        match file.seek(SeekFrom::Start(current_size)) {
+                            Ok(_) => {}
+                            Err(e) => {
+                                g.open_files.insert(fh.0, of);
+                                reply.error(errno(io_errno(&e)));
+                                return;
+                            }
+                        }
+                        let zeros = vec![0u8; diff as usize];
+                        match file.write_all(&zeros) {
+                            Ok(_) => {}
+                            Err(e) => {
+                                g.open_files.insert(fh.0, of);
+                                reply.error(errno(io_errno(&e)));
+                                return;
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+            FileState::CowClean {
+                object_id: object_id_opt,
+            } => {
+                let size = if let Some(id) = *object_id_opt {
+                    match g.daemon.get_object(id) {
+                        Ok(bytes) => bytes.len() as u64,
+                        Err(_) => {
+                            g.open_files.insert(fh.0, of);
+                            reply.error(Errno::EIO);
+                            return;
+                        }
+                    }
+                } else {
+                    let real_path = root.join(of.path.strip_prefix("/").unwrap_or(&of.path));
+                    match std::fs::metadata(&real_path) {
+                        Ok(meta) => meta.len(),
+                        Err(_) => {
+                            g.open_files.insert(fh.0, of);
+                            reply.error(Errno::EIO);
+                            return;
+                        }
+                    }
+                };
+                let end = offset.saturating_add(length);
+                if end > size {
+                    let mode_keep_size = mode & libc::FALLOC_FL_KEEP_SIZE as i32;
+                    if mode_keep_size != 0 {
+                        if let Some(id) = *object_id_opt {
+                            if let Ok(mut bytes) = g.daemon.get_object(id) {
+                                bytes.resize(end as usize, 0);
+                                let _ = g.daemon.put_file(
+                                    of.path.clone(),
+                                    bytes.clone(),
+                                    crate::syncing::proto::FileMetadata {
+                                        size: bytes.len() as u64,
+                                        mode: libc::S_IFREG | 0o644,
+                                        uid: 0,
+                                        gid: 0,
+                                        mtime: now_unix(),
+                                        atime: now_unix(),
+                                        ctime: now_unix(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+            FileState::FuseOnlyClean { object_id } => {
+                let id = *object_id;
+                let size = match g.daemon.get_object(id) {
+                    Ok(bytes) => bytes.len() as u64,
+                    Err(_) => {
+                        g.open_files.insert(fh.0, of);
+                        reply.error(Errno::EIO);
+                        return;
+                    }
+                };
+                let end = offset.saturating_add(length);
+                if end > size {
+                    let mode_keep_size = mode & libc::FALLOC_FL_KEEP_SIZE as i32;
+                    if mode_keep_size != 0 {
+                        if let Ok(mut bytes) = g.daemon.get_object(id) {
+                            bytes.resize(end as usize, 0);
+                            let _ = g.daemon.put_file(
+                                of.path.clone(),
+                                bytes.clone(),
+                                crate::syncing::proto::FileMetadata {
+                                    size: bytes.len() as u64,
+                                    mode: libc::S_IFREG | 0o644,
+                                    uid: 0,
+                                    gid: 0,
+                                    mtime: now_unix(),
+                                    atime: now_unix(),
+                                    ctime: now_unix(),
+                                },
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            }
+        };
+
+        g.open_files.insert(fh.0, of);
+
+        match res {
+            Ok(()) => reply.ok(),
+            Err(code) => reply.error(errno(code)),
+        }
     }
 }
