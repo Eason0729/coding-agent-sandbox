@@ -11,16 +11,6 @@ Seccomp runs in the sandboxed process after chroot but before exec. It uses libs
 3. Allow syscalls needed for FUSE communication
 4. Return `SECCOMP_RET_KILL` for blocked syscalls (process is killed)
 
----
-
-## Function
-
-```rust
-pub fn apply_seccomp_filter() -> Result<()>
-```
-
----
-
 ## Syscall Whitelist
 
 The filter allows these syscall categories:
@@ -99,8 +89,6 @@ The filter allows these syscall categories:
 | `iopl`, `ioperm` | I/O port access |
 | `idle` | CPU idle |
 
----
-
 ## Notes
 
 - **FUSE communication**: The sandboxed process communicates with the FUSE daemon via a Unix socket. This requires `socket`, `connect`, `sendmsg`, `recvmsg`, etc. The socket is passed as an fd into the chroot (via the bind mount of `/project` which contains the socket).
@@ -110,118 +98,3 @@ The filter allows these syscall categories:
 - **Network Allow**: Network syscalls (`socket` with `AF_INET`, `bind` with a port, etc.) are allowed, and the network namespace isn't unshared.
 
 - **Seccomp failure**: If seccomp fails to load (e.g., on older kernels), return an error and abort the sandbox launch. The process must not run without the filter.
-
----
-
-## Known Bug — Interactive Shell SIGSYS
-
-### Symptom
-
-```
-$ cas run bash
-child killed by signal: SIGSYS
-```
-
-Running an interactive shell (`bash` with no `-c` argument) causes the sandboxed process to be killed by seccomp.
-
-### Root Cause
-
-Interactive bash calls syscalls during startup that are not in the allowlist:
-
-| Syscall | x86_64 # | Reason called |
-|---|---|---|
-| `epoll_create1` | 291 | readline initializes an epoll-based event loop when stdin is a real TTY |
-| `setfsuid` | 122 | bash normalizes filesystem UID at startup |
-| `setfsgid` | 123 | bash normalizes filesystem GID at startup |
-
-`epoll_create` (213) was in the allowlist but `epoll_create1` (291) was not — they are distinct syscalls.
-
-### Debugging Method (no root required)
-
-1. Change seccomp default action to `SCMP_ACT_ERRNO(ENOSYS)` — process survives but blocked calls return ENOSYS.
-2. Run the failing command to confirm it completes without SIGSYS.
-3. Change to `SCMP_ACT_LOG` — blocked calls are logged to the audit subsystem.
-4. Re-run and check `journalctl --since "1 minute ago" | grep SECCOMP` for the syscall numbers.
-5. Decode: `ausyscall x86_64 <number>`.
-
-> Note: `strace` bypasses seccomp (ptrace intercepts before seccomp fires), so ENOSYS returns are not visible in strace output. Use journalctl with `SCMP_ACT_LOG` instead.
-
-### Fix
-
-Add the three syscalls to the `allow_core_syscalls` list in `isolate/seccomp.rs`.
-
----
-
-## Known Bug — `deno repl` SIGSYS
-
-### Symptom
-
-```
-$ cas run ./deno repl
-child killed by signal: SIGSYS
-```
-
-### Root Cause
-
-`deno repl` performs file locking on cache/history files using `flock(2)`.
-
-- `strace ./deno repl` outside sandbox shows `flock(..., LOCK_SH/LOCK_EX/LOCK_UN)` calls.
-- In sandbox, seccomp audit logs show blocked `syscall=73` (`ausyscall x86_64 73 -> flock`).
-
-Because `flock` was missing from the seccomp allowlist, the process was terminated when default action was `KILL_PROCESS`.
-
-### Verification Method
-
-1. Temporarily set seccomp default action to `SCMP_ACT_LOG`.
-2. Re-run `cas run ./deno repl`.
-3. Inspect audit log with `journalctl --since "3 minutes ago" | grep SECCOMP`.
-4. Decode syscall number via `ausyscall x86_64 73`.
-5. Add `flock` to allowlist and restore `SCMP_ACT_KILL_PROCESS`.
-6. Re-run and confirm `deno repl` starts without SIGSYS.
-
-### Fix
-
-Add `"flock"` to `allow_core_syscalls` in `isolate/seccomp.rs`.
-
----
-
-## Known Bug — Volta-managed `deno` (`~/.volta/bin/deno -V`) SIGSYS
-
-### Symptom
-
-```
-$ cas run ~/.volta/bin/deno -V
-child killed by signal: SIGSYS
-```
-
-### Root Cause
-
-The Volta shim launches Node (`~/.volta/tools/image/node/.../bin/node`) before dispatching to Deno.
-That Node runtime attempts to initialize io_uring and uses syscalls not previously allowed:
-
-- `io_uring_setup` (syscall 425 on x86_64)
-- `io_uring_enter` (syscall 426 on x86_64)
-
-Observed via seccomp audit logs while running with temporary `SCMP_ACT_LOG`:
-
-```
-SECCOMP ... comm="node" ... syscall=425
-SECCOMP ... comm="node" ... syscall=426
-```
-
-### Verification Method
-
-1. Keep default seccomp action as `SCMP_ACT_KILL_PROCESS`, reproduce failure.
-2. Temporarily switch to `SCMP_ACT_LOG` and rerun command.
-3. Check audit log (`journalctl ... | grep SECCOMP`) to identify blocked syscalls.
-4. Decode numbers with `ausyscall x86_64 <nr>`.
-5. Add the io_uring syscalls to allowlist.
-6. Restore `SCMP_ACT_KILL_PROCESS` and verify `cas run ~/.volta/bin/deno -V` succeeds.
-
-### Fix
-
-Add these to `allow_core_syscalls` in `isolate/seccomp.rs`:
-
-- `"io_uring_setup"`
-- `"io_uring_enter"`
-- `"io_uring_register"` (paired syscall, added for completeness)
