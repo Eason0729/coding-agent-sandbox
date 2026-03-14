@@ -152,8 +152,6 @@ pub fn cmd_run(project_root: &Path, cmd_args: &[String]) -> Result<()> {
     let cmd_argv: Vec<String> = cmd_args.to_vec();
     let daemon_socket_clone = daemon_socket.clone();
     let policy_clone = Arc::clone(&policy);
-    let project_root_buf = project_root.to_path_buf();
-
     // 7. Second fork: setup(1) process
     let child_pid = match unsafe { fork() } {
         Ok(ForkResult::Child) => {
@@ -183,6 +181,7 @@ pub fn cmd_run(project_root: &Path, cmd_args: &[String]) -> Result<()> {
                     // FUSE so the sandboxed process sees a complete root tree.
                     let fuse_fs = crate::fuse::CasFuseFs::new(
                         std::path::PathBuf::from("/"),
+                        daemon_socket_clone.clone(),
                         daemon,
                         policy_clone,
                     );

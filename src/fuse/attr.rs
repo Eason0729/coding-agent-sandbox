@@ -5,6 +5,24 @@ use fuser::{FileAttr, FileType, INodeNo};
 
 use crate::syncing::proto::FileMetadata;
 
+fn system_time_from_unix_i64(secs: i64) -> SystemTime {
+    if secs >= 0 {
+        return UNIX_EPOCH
+            .checked_add(Duration::from_secs(secs as u64))
+            .unwrap_or(UNIX_EPOCH);
+    }
+
+    UNIX_EPOCH
+        .checked_sub(Duration::from_secs(secs.unsigned_abs()))
+        .unwrap_or(UNIX_EPOCH)
+}
+
+fn system_time_from_unix_u64(secs: u64) -> SystemTime {
+    UNIX_EPOCH
+        .checked_add(Duration::from_secs(secs))
+        .unwrap_or(UNIX_EPOCH)
+}
+
 pub fn attr_from_meta(ino: u64, meta: &std::fs::Metadata) -> FileAttr {
     let kind = if meta.is_dir() {
         FileType::Directory
@@ -13,9 +31,9 @@ pub fn attr_from_meta(ino: u64, meta: &std::fs::Metadata) -> FileAttr {
     } else {
         FileType::RegularFile
     };
-    let atime = UNIX_EPOCH + Duration::from_secs(meta.atime() as u64);
-    let mtime = UNIX_EPOCH + Duration::from_secs(meta.mtime() as u64);
-    let ctime = UNIX_EPOCH + Duration::from_secs(meta.ctime() as u64);
+    let atime = system_time_from_unix_i64(meta.atime());
+    let mtime = system_time_from_unix_i64(meta.mtime());
+    let ctime = system_time_from_unix_i64(meta.ctime());
     FileAttr {
         ino: INodeNo(ino),
         size: meta.size(),
@@ -45,9 +63,9 @@ pub fn attr_from_nix_stat(ino: u64, meta: &libc::stat) -> FileAttr {
     } else {
         FileType::RegularFile
     };
-    let atime = UNIX_EPOCH + Duration::from_secs(meta.st_atime as u64);
-    let mtime = UNIX_EPOCH + Duration::from_secs(meta.st_mtime as u64);
-    let ctime = UNIX_EPOCH + Duration::from_secs(meta.st_ctime as u64);
+    let atime = system_time_from_unix_i64(meta.st_atime);
+    let mtime = system_time_from_unix_i64(meta.st_mtime);
+    let ctime = system_time_from_unix_i64(meta.st_ctime);
     FileAttr {
         ino: INodeNo(ino),
         size: meta.st_size as u64,
@@ -68,9 +86,9 @@ pub fn attr_from_nix_stat(ino: u64, meta: &libc::stat) -> FileAttr {
 }
 
 pub fn attr_from_daemon(ino: u64, meta: &FileMetadata, kind: FileType) -> FileAttr {
-    let atime = UNIX_EPOCH + Duration::from_secs(meta.atime);
-    let mtime = UNIX_EPOCH + Duration::from_secs(meta.mtime);
-    let ctime = UNIX_EPOCH + Duration::from_secs(meta.ctime);
+    let atime = system_time_from_unix_u64(meta.atime);
+    let mtime = system_time_from_unix_u64(meta.mtime);
+    let ctime = system_time_from_unix_u64(meta.ctime);
     FileAttr {
         ino: INodeNo(ino),
         size: meta.size,
@@ -87,5 +105,22 @@ pub fn attr_from_daemon(ino: u64, meta: &FileMetadata, kind: FileType) -> FileAt
         rdev: 0,
         blksize: 4096,
         flags: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unix_i64_negative_is_handled() {
+        let t = system_time_from_unix_i64(-1);
+        assert!(UNIX_EPOCH.duration_since(t).is_ok());
+    }
+
+    #[test]
+    fn unix_u64_huge_does_not_panic() {
+        let t = system_time_from_unix_u64(u64::MAX);
+        assert_eq!(t, UNIX_EPOCH);
     }
 }

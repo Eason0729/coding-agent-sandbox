@@ -26,6 +26,18 @@ The FUSE `FileAttr` struct contains:
 | `blksize` | `u32` | Block size for I/O |
 | `flags` | `u32` | File flags |
 
+## Timestamp Safety
+
+Linux metadata timestamps (`atime`/`mtime`/`ctime`) are signed values at syscall boundary. Some files can expose negative values (pre-1970), which must not be cast directly to `u64`.
+
+Required behavior in attribute builders:
+
+- Convert signed unix seconds with a checked helper.
+- For negative values, construct time using `UNIX_EPOCH.checked_sub(...)`.
+- For large positive values, use `UNIX_EPOCH.checked_add(...)` and fall back safely on overflow.
+
+This avoids panics in fuser reply scheduling paths that add TTL to internal instants after receiving malformed/overflow-prone times.
+
 ## Builder Functions
 
 ### attr_from_meta(ino: u64, meta: &std::fs::Metadata) -> FileAttr

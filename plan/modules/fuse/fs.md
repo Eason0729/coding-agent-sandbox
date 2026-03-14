@@ -52,9 +52,9 @@ struct Inner {
 
 Each FUSE handler follows a consistent pattern:
 
-1. Acquire lock on `Inner`
+1. Acquire only the minimal lock needed (inode-table mutex, per-open-file mutex, or daemon client)
 2. Resolve inode → path (or return ENOENT)
-3. Get `OpenFile` from file handle (for read/write operations)
+3. Get `OpenFile` from the concurrent file-handle table (for read/write operations)
 4. Delegate to `OpenFile` methods for actual I/O
 5. Return result via reply
 
@@ -63,8 +63,8 @@ Each FUSE handler follows a consistent pattern:
 The single global `Arc<Mutex<Inner>>` is replaced by finer-grained synchronization:
 
 - inode table: per-row concurrent hashmap
-- open file table: concurrent hashmap of `fh -> Arc<Mutex<OpenFile>>`
-- daemon client: one client per request thread (or pool), not a single shared stream behind the global lock
+- open file table: `fh -> Arc<Mutex<OpenFile>>` so file-handle operations serialize per-fh, not globally
+- daemon client: bounded `SyncClientPool` checkout per operation, reusing persistent unix-socket connections while avoiding one shared stream bottleneck
 
 Goal: allow independent FUSE operations on distinct files/inodes to proceed concurrently.
 
@@ -72,16 +72,20 @@ Goal: allow independent FUSE operations on distinct files/inodes to proceed conc
 
 ```rust
 fn read(&self, _req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, size: u32, ...) {
-    let mut g = self.lock();
-    let path = match g.inodes.get_path(ino.0).map(Path::to_path_buf) {
-        Some(p) => p,
-        None => { reply.error(errno(libc::ENOENT)); return; }
-    };
-    let of = match g.open_files.get_mut(&fh.0) {
-        Some(of) => of,
+    let of_arc = match self.open_files.get(&fh.0) {
+        Some(v) => Arc::clone(v.value()),
         None => { reply.error(errno(libc::EBADF)); return; }
     };
-    match of.read_at(offset, size, &g.root, &mut g.daemon) {
+    if self.inodes.lock().unwrap().get_path(ino.0).is_none() {
+        reply.error(errno(libc::ENOENT));
+        return;
+    }
+    let mut daemon = match self.connect_daemon() {
+        Ok(d) => d,
+        Err(code) => { reply.error(errno(code)); return; }
+    };
+    let mut of = of_arc.lock().unwrap();
+    match of.read_at(offset, size, &self.root, &mut daemon) {
         Ok(buf) => reply.data(&buf),
         Err(code) => reply.error(errno(code)),
     }
@@ -92,16 +96,20 @@ fn read(&self, _req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, size: 
 
 ```rust
 fn write(&self, _req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, data: &[u8], ...) {
-    let mut g = self.lock();
-    let path = match g.inodes.get_path(ino.0).map(Path::to_path_buf) {
-        Some(p) => p,
-        None => { reply.error(errno(libc::ENOENT)); return; }
-    };
-    let of = match g.open_files.get_mut(&fh.0) {
-        Some(of) => of,
+    let of_arc = match self.open_files.get(&fh.0) {
+        Some(v) => Arc::clone(v.value()),
         None => { reply.error(errno(libc::EBADF)); return; }
     };
-    match of.write_at(offset, data, &g.root, &mut g.daemon) {
+    if self.inodes.lock().unwrap().get_path(ino.0).is_none() {
+        reply.error(errno(libc::ENOENT));
+        return;
+    }
+    let mut daemon = match self.connect_daemon() {
+        Ok(d) => d,
+        Err(code) => { reply.error(errno(code)); return; }
+    };
+    let mut of = of_arc.lock().unwrap();
+    match of.write_at(offset, data, &self.root, &mut daemon) {
         Ok(n) => reply.written(n as u32),
         Err(code) => reply.error(errno(code)),
     }

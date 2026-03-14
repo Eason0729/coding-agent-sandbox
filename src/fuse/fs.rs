@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io;
@@ -6,8 +6,11 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use dashmap::{DashMap, DashSet};
 
 use fuser::{
     AccessFlags, CopyFileRangeFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
@@ -21,7 +24,20 @@ use crate::fuse::inode::InodeTable;
 use crate::fuse::open_file::{tmp_as_file, FileState, OpenFile, TTL};
 use crate::fuse::policy::{AccessMode, Policy};
 use crate::syncing::client::SyncClient;
+use crate::syncing::pool::{PooledSyncClient, SyncClientPool};
 use crate::syncing::proto::{EntryType, FileMetadata, FuseEntry};
+
+macro_rules! get_sync_client {
+    ($s:ident, $r: ident) => {
+        match $s.connect_daemon() {
+            Ok(d) => d,
+            Err(code) => {
+                $r.error(errno(code));
+                return;
+            }
+        }
+    };
+}
 
 fn errno(code: libc::c_int) -> Errno {
     Errno::from_i32(code)
@@ -48,6 +64,14 @@ fn file_meta_with_now(size: u64, mode: u32, uid: u32, gid: u32) -> FileMetadata 
         mtime: now,
         atime: now,
         ctime: now,
+    }
+}
+
+fn unix_i64_to_u64_saturating(secs: i64) -> u64 {
+    if secs.is_negative() {
+        0
+    } else {
+        secs as u64
     }
 }
 
@@ -90,12 +114,12 @@ fn normalize_abs(path: &Path) -> PathBuf {
 struct Inner {
     root: PathBuf,
     inodes: InodeTable,
-    open_files: HashMap<u64, OpenFile>,
-    next_fh: u64,
-    daemon: SyncClient,
-    logged_once: HashSet<PathBuf>,
+    open_files: DashMap<u64, OpenFile>,
+    next_fh: AtomicU64,
+    logged_once: DashSet<PathBuf>,
     mount_uid: u32,
     mount_gid: u32,
+    daemon_pool: SyncClientPool,
 }
 
 impl Inner {
@@ -103,10 +127,8 @@ impl Inner {
         self.inodes.get_path(ino.0)
     }
 
-    fn alloc_fh(&mut self) -> u64 {
-        let fh = self.next_fh;
-        self.next_fh = self.next_fh.saturating_add(1);
-        fh
+    fn alloc_fh(&self) -> u64 {
+        self.next_fh.fetch_add(1, Ordering::Relaxed)
     }
 
     fn real_path(&self, path: &Path) -> PathBuf {
@@ -119,10 +141,15 @@ impl Inner {
         self.inodes.get_path(ino.0).map(|p| (ino, p))
     }
 
+    fn connect_daemon(&self) -> Result<PooledSyncClient, libc::c_int> {
+        self.daemon_pool.checkout().map_err(|_| libc::EIO)
+    }
+
     fn stat_path(
-        &mut self,
+        &self,
         path: &Path,
         mode: &AccessMode,
+        daemon: &mut PooledSyncClient,
     ) -> Result<(FileType, FileAttr), libc::c_int> {
         match mode {
             AccessMode::Passthrough => {
@@ -140,8 +167,7 @@ impl Inner {
                 Ok((kind, attr_from_meta(ino, &meta)))
             }
             AccessMode::CopyOnWrite => {
-                if let Some(entry) = self
-                    .daemon
+                if let Some(entry) = daemon
                     .get_entry(path.to_path_buf())
                     .map_err(|_| libc::EIO)?
                 {
@@ -174,8 +200,7 @@ impl Inner {
                 Ok((kind, attr))
             }
             AccessMode::FuseOnly => {
-                let entry = self
-                    .daemon
+                let entry = daemon
                     .get_entry(path.to_path_buf())
                     .map_err(|_| libc::EIO)?
                     .ok_or(libc::ENOENT)?;
@@ -188,44 +213,53 @@ impl Inner {
 }
 
 pub struct CasFuseFs {
-    inner: Arc<Mutex<Inner>>,
+    inner: Arc<Inner>,
     policy: Arc<dyn Policy>,
 }
 
 impl CasFuseFs {
-    pub fn new(root: PathBuf, daemon: SyncClient, policy: Arc<dyn Policy>) -> Self {
+    pub fn new(
+        root: PathBuf,
+        daemon_sock: PathBuf,
+        _daemon: SyncClient,
+        policy: Arc<dyn Policy>,
+    ) -> Self {
         let inodes = InodeTable::new(PathBuf::from("/"));
         let mount_uid = nix::unistd::Uid::current().as_raw();
         let mount_gid = nix::unistd::Gid::current().as_raw();
         Self {
-            inner: Arc::new(Mutex::new(Inner {
+            inner: Arc::new(Inner {
                 root,
                 inodes,
-                open_files: HashMap::new(),
-                next_fh: 1,
-                daemon,
-                logged_once: HashSet::new(),
+                open_files: DashMap::new(),
+                next_fh: AtomicU64::new(1),
+                logged_once: DashSet::new(),
                 mount_uid,
                 mount_gid,
-            })),
+                daemon_pool: SyncClientPool::new(daemon_sock, 16),
+            }),
             policy,
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, Inner> {
-        self.inner.lock().expect("CasFuseFs mutex poisoned")
+    fn connect_daemon(&self) -> Result<PooledSyncClient, libc::c_int> {
+        self.inner.daemon_pool.checkout().map_err(|_| libc::EIO)
     }
 
-    fn maybe_log(&self, req: &Request, g: &mut Inner, path: &Path, op: &str) {
+    fn lock(&self) -> Arc<Inner> {
+        Arc::clone(&self.inner)
+    }
+
+    fn maybe_log(&self, g: &Inner, path: &Path, op: &str, pid: u32) {
         if !self.policy.should_log(path) {
             return;
         }
         if !g.logged_once.insert(path.to_path_buf()) {
             return;
         }
-        let _ = g
-            .daemon
-            .log_access(path.to_path_buf(), op.to_string(), req.pid());
+        if let Ok(mut daemon) = self.connect_daemon() {
+            let _ = daemon.log_access(path.to_path_buf(), op.to_string(), pid);
+        }
     }
 
     fn req_start(&self, req: &Request, op: &str, path: Option<&Path>, detail: &str) {
@@ -310,8 +344,7 @@ impl Filesystem for CasFuseFs {
             None,
             &format!("parent={} name={}", parent.0, name.to_string_lossy()),
         );
-        let mut g = self.lock();
-        let parent_path = match g.path_of(parent) {
+        let parent_path = match self.inner.path_of(parent) {
             Some(p) => p,
             None => {
                 self.req_err(req, "lookup", None, libc::ENOENT, "parent inode missing");
@@ -321,10 +354,12 @@ impl Filesystem for CasFuseFs {
         };
 
         let path = normalize_abs(&parent_path.join(name));
-        self.maybe_log(req, &mut g, &path, "lookup");
         let mode = self.policy.classify(&path);
+        let g = self.lock();
 
-        match g.stat_path(&path, &mode) {
+        let mut daemon = get_sync_client!(self, reply);
+        self.maybe_log(&g, &path, "lookup", req.pid());
+        match g.stat_path(&path, &mode, &mut daemon) {
             Ok((_kind, attr)) => {
                 self.req_ok(req, "lookup", Some(&path), "entry found");
                 reply.entry(&TTL, &attr, fuser::Generation(0));
@@ -354,9 +389,17 @@ impl Filesystem for CasFuseFs {
             }
         };
 
-        self.maybe_log(req, &mut g, &path, "getattr");
+        self.maybe_log(&g, &path, "getattr", req.pid());
         let mode = self.policy.classify(&path);
-        match g.stat_path(&path, &mode) {
+        let mut daemon = match self.connect_daemon() {
+            Ok(d) => d,
+            Err(code) => {
+                self.req_err(req, "getattr", Some(&path), code, "daemon connect failed");
+                reply.error(errno(code));
+                return;
+            }
+        };
+        match g.stat_path(&path, &mode, &mut daemon) {
             Ok((_kind, attr)) => {
                 self.req_ok(req, "getattr", Some(&path), "attr resolved");
                 reply.attr(&TTL, &attr)
@@ -395,6 +438,14 @@ impl Filesystem for CasFuseFs {
             }
         };
         let access = self.policy.classify(&path);
+
+        let mut daemon = match g.connect_daemon() {
+            Ok(d) => d,
+            Err(code) => {
+                reply.error(errno(code));
+                return;
+            }
+        };
 
         match access {
             AccessMode::Passthrough => {
@@ -453,26 +504,31 @@ impl Filesystem for CasFuseFs {
                     }
                 }
 
-                match g.stat_path(&path, &AccessMode::Passthrough) {
+                let mut daemon = match g.connect_daemon() {
+                    Ok(d) => d,
+                    Err(code) => {
+                        reply.error(errno(code));
+                        return;
+                    }
+                };
+                match g.stat_path(&path, &AccessMode::Passthrough, &mut daemon) {
                     Ok((_k, attr)) => reply.attr(&TTL, &attr),
                     Err(code) => reply.error(errno(code)),
                 }
             }
             AccessMode::FuseOnly | AccessMode::CopyOnWrite => {
                 if let Some(fh) = fh {
-                    if let Some(mut of) = g.open_files.remove(&fh.0) {
+                    if let Some(mut of) = g.open_files.get_mut(&fh.0) {
                         let root = g.root.clone();
                         if let Some(sz) = size {
                             match &mut of.state {
                                 FileState::CowClean { .. } => {
-                                    if let Err(code) = of.materialize(&root, &mut g.daemon) {
-                                        g.open_files.insert(fh.0, of);
+                                    if let Err(code) = of.materialize(&root, &mut daemon) {
                                         reply.error(errno(code));
                                         return;
                                     }
                                     if let FileState::CowDirty { tmp, .. } = &mut of.state {
                                         if let Err(e) = tmp.as_file_mut().set_len(sz) {
-                                            g.open_files.insert(fh.0, of);
                                             reply.error(errno(io_errno(&e)));
                                             return;
                                         }
@@ -482,21 +538,18 @@ impl Filesystem for CasFuseFs {
                                 | FileState::FuseOnlyDirty { tmp, .. }
                                 | FileState::FuseOnlyNew { tmp } => {
                                     if let Err(e) = tmp.as_file_mut().set_len(sz) {
-                                        g.open_files.insert(fh.0, of);
                                         reply.error(errno(io_errno(&e)));
                                         return;
                                     }
                                 }
                                 FileState::FuseOnlyClean { .. } => {
-                                    if let Err(code) = of.write_at(sz, &[], &root, &mut g.daemon) {
-                                        g.open_files.insert(fh.0, of);
+                                    if let Err(code) = of.write_at(sz, &[], &root, &mut daemon) {
                                         reply.error(errno(code));
                                         return;
                                     }
                                     match &mut of.state {
                                         FileState::FuseOnlyDirty { tmp, .. } => {
                                             if let Err(e) = tmp.as_file_mut().set_len(sz) {
-                                                g.open_files.insert(fh.0, of);
                                                 reply.error(errno(io_errno(&e)));
                                                 return;
                                             }
@@ -514,17 +567,14 @@ impl Filesystem for CasFuseFs {
                             }
                         }
 
-                        if let Err(code) = of.flush_to_daemon(&mut g.daemon) {
-                            g.open_files.insert(fh.0, of);
+                        if let Err(code) = of.flush_to_daemon(&mut daemon) {
                             reply.error(errno(code));
                             return;
                         }
-
-                        g.open_files.insert(fh.0, of);
                     }
                 }
 
-                let mut new_meta = if let Ok(Some(entry)) = g.daemon.get_entry(path.to_path_buf()) {
+                let mut new_meta = if let Ok(Some(entry)) = daemon.get_entry(path.to_path_buf()) {
                     entry.metadata
                 } else {
                     let real = g.real_path(&path);
@@ -534,9 +584,9 @@ impl Filesystem for CasFuseFs {
                             mode: meta.mode(),
                             uid: meta.uid(),
                             gid: meta.gid(),
-                            mtime: meta.mtime() as u64,
-                            atime: meta.atime() as u64,
-                            ctime: meta.ctime() as u64,
+                            mtime: unix_i64_to_u64_saturating(meta.mtime()),
+                            atime: unix_i64_to_u64_saturating(meta.atime()),
+                            ctime: unix_i64_to_u64_saturating(meta.ctime()),
                         },
                         Err(_) => file_meta_with_now(0, libc::S_IFREG | 0o644, 0, 0),
                     }
@@ -560,7 +610,7 @@ impl Filesystem for CasFuseFs {
                 new_meta.atime = now;
                 new_meta.ctime = now;
 
-                if g.daemon
+                if daemon
                     .put_file_meta(path.to_path_buf(), new_meta.clone())
                     .is_err()
                 {
@@ -574,13 +624,13 @@ impl Filesystem for CasFuseFs {
                             bytes.truncate(new_len);
                         }
                     }
-                    if g.daemon.put_file(path.clone(), bytes, new_meta).is_err() {
+                    if daemon.put_file(path.clone(), bytes, new_meta).is_err() {
                         reply.error(Errno::EIO);
                         return;
                     }
                 }
 
-                match g.stat_path(&path, &access) {
+                match g.stat_path(&path, &access, &mut daemon) {
                     Ok((_k, attr)) => reply.attr(&TTL, &attr),
                     Err(code) => reply.error(errno(code)),
                 }
@@ -599,6 +649,14 @@ impl Filesystem for CasFuseFs {
         };
         let mode = self.policy.classify(&path);
 
+        let mut daemon = match g.connect_daemon() {
+            Ok(d) => d,
+            Err(code) => {
+                reply.error(errno(code));
+                return;
+            }
+        };
+
         let data = match mode {
             AccessMode::Passthrough => {
                 let real = g.real_path(&path);
@@ -611,7 +669,7 @@ impl Filesystem for CasFuseFs {
                 }
             }
             AccessMode::FuseOnly => {
-                let entry = match g.daemon.get_entry(path.clone()) {
+                let entry = match daemon.get_entry(path.clone()) {
                     Ok(Some(e)) => e,
                     Ok(None) => {
                         reply.error(Errno::ENOENT);
@@ -626,7 +684,7 @@ impl Filesystem for CasFuseFs {
                     reply.error(Errno::EINVAL);
                     return;
                 }
-                match g.daemon.get_object(entry.id) {
+                match daemon.get_object(entry.id) {
                     Ok(bytes) => bytes,
                     Err(_) => {
                         reply.error(Errno::EIO);
@@ -635,9 +693,9 @@ impl Filesystem for CasFuseFs {
                 }
             }
             AccessMode::CopyOnWrite => {
-                if let Ok(Some(entry)) = g.daemon.get_entry(path.clone()) {
+                if let Ok(Some(entry)) = daemon.get_entry(path.clone()) {
                     if kind_from_entry(&entry) == Some(FileType::Symlink) {
-                        match g.daemon.get_object(entry.id) {
+                        match daemon.get_object(entry.id) {
                             Ok(bytes) => bytes,
                             Err(_) => {
                                 reply.error(Errno::EIO);
@@ -689,8 +747,16 @@ impl Filesystem for CasFuseFs {
         };
 
         let path = normalize_abs(&parent_path.join(name));
-        self.maybe_log(req, &mut g, &path, "mkdir");
         let access = self.policy.classify(&path);
+
+        let mut daemon = match g.connect_daemon() {
+            Ok(d) => d,
+            Err(code) => {
+                reply.error(errno(code));
+                return;
+            }
+        };
+        self.maybe_log(&g, &path, "mkdir", req.pid());
 
         match access {
             AccessMode::Passthrough => {
@@ -720,11 +786,11 @@ impl Filesystem for CasFuseFs {
                     atime: now_unix(),
                     ctime: now_unix(),
                 };
-                if g.daemon.put_dir(path.clone(), meta).is_err() {
+                if daemon.put_dir(path.clone(), meta).is_err() {
                     reply.error(Errno::EIO);
                     return;
                 }
-                match g.stat_path(&path, &access) {
+                match g.stat_path(&path, &access, &mut daemon) {
                     Ok((_k, attr)) => reply.entry(&TTL, &attr, fuser::Generation(0)),
                     Err(code) => reply.error(errno(code)),
                 }
@@ -742,8 +808,16 @@ impl Filesystem for CasFuseFs {
             }
         };
         let path = normalize_abs(&parent_path.join(name));
-        self.maybe_log(req, &mut g, &path, "unlink");
         let access = self.policy.classify(&path);
+
+        let mut daemon = match g.connect_daemon() {
+            Ok(d) => d,
+            Err(code) => {
+                reply.error(errno(code));
+                return;
+            }
+        };
+        self.maybe_log(&g, &path, "unlink", req.pid());
 
         match access {
             AccessMode::Passthrough => {
@@ -753,17 +827,17 @@ impl Filesystem for CasFuseFs {
                     Err(e) => reply.error(errno(io_errno(&e))),
                 }
             }
-            AccessMode::FuseOnly => match g.daemon.delete_file(path) {
+            AccessMode::FuseOnly => match daemon.delete_file(path) {
                 Ok(()) => reply.ok(),
                 Err(_) => reply.error(Errno::EIO),
             },
-            AccessMode::CopyOnWrite => match g.daemon.get_entry(path.clone()) {
+            AccessMode::CopyOnWrite => match daemon.get_entry(path.clone()) {
                 Ok(Some(entry)) => {
                     if entry.entry_type == EntryType::Whiteout {
                         reply.error(Errno::ENOENT);
                         return;
                     }
-                    match g.daemon.delete_file(path) {
+                    match daemon.delete_file(path) {
                         Ok(()) => reply.ok(),
                         Err(_) => reply.error(Errno::EIO),
                     }
@@ -771,7 +845,7 @@ impl Filesystem for CasFuseFs {
                 Ok(None) => {
                     let real = g.real_path(&path);
                     if real.exists() {
-                        match g.daemon.put_whiteout(path) {
+                        match daemon.put_whiteout(path) {
                             Ok(()) => reply.ok(),
                             Err(_) => reply.error(Errno::EIO),
                         }
@@ -794,8 +868,16 @@ impl Filesystem for CasFuseFs {
             }
         };
         let path = normalize_abs(&parent_path.join(name));
-        self.maybe_log(req, &mut g, &path, "rmdir");
         let access = self.policy.classify(&path);
+
+        let mut daemon = match g.connect_daemon() {
+            Ok(d) => d,
+            Err(code) => {
+                reply.error(errno(code));
+                return;
+            }
+        };
+        self.maybe_log(&g, &path, "rmdir", req.pid());
 
         match access {
             AccessMode::Passthrough => {
@@ -806,7 +888,7 @@ impl Filesystem for CasFuseFs {
                 }
             }
             AccessMode::FuseOnly | AccessMode::CopyOnWrite => {
-                let children = match g.daemon.read_dir_all(path.clone()) {
+                let children = match daemon.read_dir_all(path.clone()) {
                     Ok(v) => v,
                     Err(_) => {
                         reply.error(Errno::EIO);
@@ -819,11 +901,11 @@ impl Filesystem for CasFuseFs {
                 }
 
                 if matches!(access, AccessMode::CopyOnWrite)
-                    && matches!(g.daemon.get_entry(path.clone()), Ok(None))
+                    && matches!(daemon.get_entry(path.clone()), Ok(None))
                 {
                     let real = g.real_path(&path);
                     if real.exists() {
-                        match g.daemon.put_whiteout(path) {
+                        match daemon.put_whiteout(path) {
                             Ok(()) => reply.ok(),
                             Err(_) => reply.error(Errno::EIO),
                         }
@@ -831,7 +913,7 @@ impl Filesystem for CasFuseFs {
                         reply.error(Errno::ENOENT)
                     }
                 } else {
-                    match g.daemon.delete_file(path) {
+                    match daemon.delete_file(path) {
                         Ok(()) => reply.ok(),
                         Err(_) => reply.error(Errno::EIO),
                     }
@@ -868,13 +950,21 @@ impl Filesystem for CasFuseFs {
         let from = normalize_abs(&from_parent.join(name));
         let to = normalize_abs(&to_parent.join(newname));
 
-        self.maybe_log(req, &mut g, &from, "rename");
         let from_mode = self.policy.classify(&from);
         let to_mode = self.policy.classify(&to);
         if from_mode != to_mode {
             reply.error(Errno::EPERM);
             return;
         }
+
+        let mut daemon = match g.connect_daemon() {
+            Ok(d) => d,
+            Err(code) => {
+                reply.error(errno(code));
+                return;
+            }
+        };
+        self.maybe_log(&g, &from, "rename", req.pid());
 
         match from_mode {
             AccessMode::Passthrough => {
@@ -885,12 +975,10 @@ impl Filesystem for CasFuseFs {
                     Err(e) => reply.error(errno(io_errno(&e))),
                 }
             }
-            AccessMode::FuseOnly | AccessMode::CopyOnWrite => {
-                match g.daemon.rename_file(from, to) {
-                    Ok(()) => reply.ok(),
-                    Err(_) => reply.error(Errno::EIO),
-                }
-            }
+            AccessMode::FuseOnly | AccessMode::CopyOnWrite => match daemon.rename_file(from, to) {
+                Ok(()) => reply.ok(),
+                Err(_) => reply.error(Errno::EIO),
+            },
         }
     }
 
@@ -912,8 +1000,16 @@ impl Filesystem for CasFuseFs {
         };
 
         let path = normalize_abs(&parent_path.join(name));
-        self.maybe_log(req, &mut g, &path, "symlink");
         let access = self.policy.classify(&path);
+
+        let mut daemon = match g.connect_daemon() {
+            Ok(d) => d,
+            Err(code) => {
+                reply.error(errno(code));
+                return;
+            }
+        };
+        self.maybe_log(&g, &path, "symlink", req.pid());
 
         match access {
             AccessMode::Passthrough => {
@@ -939,11 +1035,11 @@ impl Filesystem for CasFuseFs {
                     req.uid(),
                     req.gid(),
                 );
-                if g.daemon.put_file(path.clone(), bytes, meta).is_err() {
+                if daemon.put_file(path.clone(), bytes, meta).is_err() {
                     reply.error(Errno::EIO);
                     return;
                 }
-                match g.stat_path(&path, &access) {
+                match g.stat_path(&path, &access, &mut daemon) {
                     Ok((_k, attr)) => reply.entry(&TTL, &attr, fuser::Generation(0)),
                     Err(code) => reply.error(errno(code)),
                 }
@@ -979,11 +1075,20 @@ impl Filesystem for CasFuseFs {
             }
         };
 
-        self.maybe_log(req, &mut g, &path, "open");
+        self.maybe_log(&g, &path, "open", req.pid());
         let access = self.policy.classify(&path);
         let accmode = flags.0 & libc::O_ACCMODE;
         let wants_write = accmode != libc::O_RDONLY;
         let trunc = (flags.0 & libc::O_TRUNC) != 0;
+
+        let mut daemon = match g.connect_daemon() {
+            Ok(d) => d,
+            Err(code) => {
+                self.req_err(req, "open", Some(&path), code, "daemon connect failed");
+                reply.error(errno(code));
+                return;
+            }
+        };
 
         let state = match access {
             AccessMode::Passthrough => {
@@ -1001,7 +1106,7 @@ impl Filesystem for CasFuseFs {
                 }
             }
             AccessMode::FuseOnly => {
-                let entry = match g.daemon.get_entry(path.clone()) {
+                let entry = match daemon.get_entry(path.clone()) {
                     Ok(Some(e)) => e,
                     Ok(None) => {
                         reply.error(Errno::ENOENT);
@@ -1046,7 +1151,7 @@ impl Filesystem for CasFuseFs {
                 }
             }
             AccessMode::CopyOnWrite => {
-                let daemon_entry = match g.daemon.get_entry(path.clone()) {
+                let daemon_entry = match daemon.get_entry(path.clone()) {
                     Ok(v) => v,
                     Err(_) => {
                         reply.error(Errno::EIO);
@@ -1158,8 +1263,16 @@ impl Filesystem for CasFuseFs {
         };
 
         let path = normalize_abs(&parent_path.join(name));
-        self.maybe_log(req, &mut g, &path, "create");
+        self.maybe_log(&g, &path, "create", req.pid());
         let access = self.policy.classify(&path);
+        let mut daemon = match g.connect_daemon() {
+            Ok(d) => d,
+            Err(code) => {
+                self.req_err(req, "create", Some(&path), code, "daemon connect failed");
+                reply.error(errno(code));
+                return;
+            }
+        };
 
         let (attr, of_state) = match access {
             AccessMode::Passthrough => {
@@ -1195,7 +1308,7 @@ impl Filesystem for CasFuseFs {
             AccessMode::FuseOnly | AccessMode::CopyOnWrite => {
                 let meta =
                     file_meta_with_now(0, libc::S_IFREG | (mode & 0o7777), req.uid(), req.gid());
-                if g.daemon
+                if daemon
                     .put_file(path.clone(), Vec::new(), meta.clone())
                     .is_err()
                 {
@@ -1220,7 +1333,7 @@ impl Filesystem for CasFuseFs {
         let fh = g.alloc_fh();
         let state = match access {
             AccessMode::FuseOnly | AccessMode::CopyOnWrite => {
-                let obj = match g.daemon.get_entry(path.clone()) {
+                let obj = match daemon.get_entry(path.clone()) {
                     Ok(Some(entry)) => entry.id,
                     _ => 0,
                 };
@@ -1260,23 +1373,27 @@ impl Filesystem for CasFuseFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        let mut g = self.lock();
+        let mut daemon = match self.connect_daemon() {
+            Ok(d) => d,
+            Err(code) => {
+                reply.error(errno(code));
+                return;
+            }
+        };
+
+        let g = self.lock();
         if g.path_of(ino).is_none() {
             reply.error(Errno::ENOENT);
             return;
         }
-
-        let mut of = match g.open_files.remove(&fh.0) {
-            Some(v) => v,
+        let root = g.root.clone();
+        let res = match g.open_files.get_mut(&fh.0) {
+            Some(mut of) => of.read_at(offset, size, &root, &mut daemon),
             None => {
                 reply.error(Errno::EBADF);
                 return;
             }
         };
-
-        let root = g.root.clone();
-        let res = of.read_at(offset, size, &root, &mut g.daemon);
-        g.open_files.insert(fh.0, of);
 
         match res {
             Ok(buf) => reply.data(&buf),
@@ -1296,23 +1413,27 @@ impl Filesystem for CasFuseFs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        let mut g = self.lock();
+        let mut daemon = match self.connect_daemon() {
+            Ok(d) => d,
+            Err(code) => {
+                reply.error(errno(code));
+                return;
+            }
+        };
+
+        let g = self.lock();
         if g.path_of(ino).is_none() {
             reply.error(Errno::ENOENT);
             return;
         }
-
-        let mut of = match g.open_files.remove(&fh.0) {
-            Some(v) => v,
+        let root = g.root.clone();
+        let res = match g.open_files.get_mut(&fh.0) {
+            Some(mut of) => of.write_at(offset, data, &root, &mut daemon),
             None => {
                 reply.error(Errno::EBADF);
                 return;
             }
         };
-
-        let root = g.root.clone();
-        let res = of.write_at(offset, data, &root, &mut g.daemon);
-        g.open_files.insert(fh.0, of);
 
         match res {
             Ok(n) => reply.written(n as u32),
@@ -1333,52 +1454,63 @@ impl Filesystem for CasFuseFs {
         _flags: CopyFileRangeFlags,
         reply: ReplyWrite,
     ) {
-        let mut g = self.lock();
-
-        if g.path_of(ino_in).is_none() {
-            reply.error(Errno::ENOENT);
-            return;
-        }
-        if g.path_of(ino_out).is_none() {
-            reply.error(Errno::ENOENT);
-            return;
-        }
-
-        let mut of_in = match g.open_files.remove(&fh_in.0) {
-            Some(v) => v,
-            None => {
-                reply.error(Errno::EBADF);
-                return;
-            }
-        };
-
-        let mut of_out = match g.open_files.remove(&fh_out.0) {
-            Some(v) => v,
-            None => {
-                g.open_files.insert(fh_in.0, of_in);
-                reply.error(Errno::EBADF);
-                return;
-            }
-        };
-
-        let root = g.root.clone();
-        let read_result = of_in.copy_from(offset_in, len, &root, &mut g.daemon);
-
-        match read_result {
-            Ok(data) => {
-                let write_result = of_out.write_at(offset_out, &data, &root, &mut g.daemon);
-                g.open_files.insert(fh_in.0, of_in);
-                g.open_files.insert(fh_out.0, of_out);
-                match write_result {
-                    Ok(n) => reply.written(n as u32),
-                    Err(code) => reply.error(errno(code)),
-                }
-            }
+        let mut daemon = match self.connect_daemon() {
+            Ok(d) => d,
             Err(code) => {
-                g.open_files.insert(fh_in.0, of_in);
-                g.open_files.insert(fh_out.0, of_out);
                 reply.error(errno(code));
+                return;
             }
+        };
+        let g = self.lock();
+        if g.path_of(ino_in).is_none() || g.path_of(ino_out).is_none() {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+        let root = g.root.clone();
+
+        if fh_in.0 == fh_out.0 {
+            let res = match g.open_files.get_mut(&fh_in.0) {
+                Some(mut of) => match of.copy_from(offset_in, len, &root, &mut daemon) {
+                    Ok(data) => of.write_at(offset_out, &data, &root, &mut daemon),
+                    Err(code) => Err(code),
+                },
+                None => {
+                    reply.error(Errno::EBADF);
+                    return;
+                }
+            };
+            match res {
+                Ok(n) => reply.written(n as u32),
+                Err(code) => reply.error(errno(code)),
+            }
+            return;
+        }
+
+        let data = match g.open_files.get_mut(&fh_in.0) {
+            Some(mut of) => match of.copy_from(offset_in, len, &root, &mut daemon) {
+                Ok(v) => v,
+                Err(code) => {
+                    reply.error(errno(code));
+                    return;
+                }
+            },
+            None => {
+                reply.error(Errno::EBADF);
+                return;
+            }
+        };
+
+        let write_res = match g.open_files.get_mut(&fh_out.0) {
+            Some(mut of) => of.write_at(offset_out, &data, &root, &mut daemon),
+            None => {
+                reply.error(Errno::EBADF);
+                return;
+            }
+        };
+
+        match write_res {
+            Ok(n) => reply.written(n as u32),
+            Err(code) => reply.error(errno(code)),
         }
     }
 
@@ -1390,18 +1522,21 @@ impl Filesystem for CasFuseFs {
         _lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
-        let mut g = self.lock();
-        let mut of = match g.open_files.remove(&fh.0) {
-            Some(v) => v,
+        let mut daemon = match self.connect_daemon() {
+            Ok(d) => d,
+            Err(code) => {
+                reply.error(errno(code));
+                return;
+            }
+        };
+        let g = self.lock();
+        let res = match g.open_files.get_mut(&fh.0) {
+            Some(mut of) => of.flush_to_daemon(&mut daemon),
             None => {
                 reply.error(Errno::EBADF);
                 return;
             }
         };
-
-        let res = of.flush_to_daemon(&mut g.daemon);
-        g.open_files.insert(fh.0, of);
-
         match res {
             Ok(()) => reply.ok(),
             Err(code) => reply.error(errno(code)),
@@ -1418,16 +1553,24 @@ impl Filesystem for CasFuseFs {
         flush: bool,
         reply: ReplyEmpty,
     ) {
-        let mut g = self.lock();
+        let g = self.lock();
         let mut of = match g.open_files.remove(&fh.0) {
-            Some(v) => v,
+            Some((_k, v)) => v,
             None => {
                 reply.error(Errno::EBADF);
                 return;
             }
         };
+
         if flush {
-            if let Err(code) = of.flush_to_daemon(&mut g.daemon) {
+            let mut daemon = match self.connect_daemon() {
+                Ok(d) => d,
+                Err(code) => {
+                    reply.error(errno(code));
+                    return;
+                }
+            };
+            if let Err(code) = of.flush_to_daemon(&mut daemon) {
                 reply.error(errno(code));
                 return;
             }
@@ -1443,18 +1586,21 @@ impl Filesystem for CasFuseFs {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        let mut g = self.lock();
-        let mut of = match g.open_files.remove(&fh.0) {
-            Some(v) => v,
+        let mut daemon = match self.connect_daemon() {
+            Ok(d) => d,
+            Err(code) => {
+                reply.error(errno(code));
+                return;
+            }
+        };
+        let g = self.lock();
+        let res = match g.open_files.get_mut(&fh.0) {
+            Some(mut of) => of.flush_to_daemon(&mut daemon),
             None => {
                 reply.error(Errno::EBADF);
                 return;
             }
         };
-
-        let res = of.flush_to_daemon(&mut g.daemon);
-        g.open_files.insert(fh.0, of);
-
         match res {
             Ok(()) => reply.ok(),
             Err(code) => reply.error(errno(code)),
@@ -1472,21 +1618,27 @@ impl Filesystem for CasFuseFs {
     ) {
         use std::io::{Seek, SeekFrom};
 
-        let mut g = self.lock();
+        let mut daemon = match self.connect_daemon() {
+            Ok(d) => d,
+            Err(code) => {
+                reply.error(errno(code));
+                return;
+            }
+        };
+        let g = self.lock();
         if g.path_of(ino).is_none() {
             reply.error(Errno::ENOENT);
             return;
         }
+        let root = g.root.clone();
 
-        let mut of = match g.open_files.remove(&fh.0) {
-            Some(v) => v,
+        let mut of = match g.open_files.get_mut(&fh.0) {
+            Some(of) => of,
             None => {
                 reply.error(Errno::EBADF);
                 return;
             }
         };
-
-        let root = g.root.clone();
         let result: Result<u64, std::io::Error> = match &mut of.state {
             FileState::Passthrough { file } => {
                 let seek_from = match whence {
@@ -1494,7 +1646,6 @@ impl Filesystem for CasFuseFs {
                     1 => SeekFrom::Current(offset),
                     2 => SeekFrom::End(offset),
                     _ => {
-                        g.open_files.insert(fh.0, of);
                         reply.error(Errno::EINVAL);
                         return;
                     }
@@ -1510,7 +1661,6 @@ impl Filesystem for CasFuseFs {
                     1 => SeekFrom::Current(offset),
                     2 => SeekFrom::End(offset),
                     _ => {
-                        g.open_files.insert(fh.0, of);
                         reply.error(Errno::EINVAL);
                         return;
                     }
@@ -1519,10 +1669,9 @@ impl Filesystem for CasFuseFs {
             }
             FileState::CowClean { object_id } => {
                 let size = if let Some(id) = object_id {
-                    match g.daemon.get_object(*id) {
+                    match daemon.get_object(*id) {
                         Ok(bytes) => bytes.len() as u64,
                         Err(_) => {
-                            g.open_files.insert(fh.0, of);
                             reply.error(Errno::EIO);
                             return;
                         }
@@ -1532,56 +1681,19 @@ impl Filesystem for CasFuseFs {
                     match std::fs::metadata(&real_path) {
                         Ok(meta) => meta.len(),
                         Err(_) => {
-                            g.open_files.insert(fh.0, of);
                             reply.error(Errno::EIO);
                             return;
                         }
                     }
                 };
-                if whence == 1 {
-                    let mut mat = false;
-                    if let Ok(Some(entry)) = g.daemon.get_entry(of.path.clone()) {
-                        if entry.metadata.size > 0 {
-                            mat = true;
-                        }
-                    }
-                    if mat {
-                        if let Err(code) = of.materialize(&root, &mut g.daemon) {
-                            g.open_files.insert(fh.0, of);
-                            reply.error(errno(code));
-                            return;
-                        }
-                        let seek_from = SeekFrom::Current(offset);
-                        let pos = if let FileState::CowDirty { tmp, .. } = &mut of.state {
-                            let mut f = tmp_as_file(tmp);
-                            f.seek(seek_from)
-                        } else {
-                            Err(std::io::Error::from_raw_os_error(libc::EIO))
-                        };
-                        g.open_files.insert(fh.0, of);
-                        match pos {
-                            Ok(p) => {
-                                reply.offset(p as i64);
-                                return;
-                            }
-                            Err(e) => {
-                                reply.error(errno(e.raw_os_error().unwrap_or(libc::EIO)));
-                                return;
-                            }
-                        }
-                    }
-                }
-
                 let new_pos = match whence {
                     0 => offset as u64,
                     1 => {
-                        g.open_files.insert(fh.0, of);
                         reply.error(Errno::EPERM);
                         return;
                     }
                     2 => (size as i64).saturating_add(offset) as u64,
                     _ => {
-                        g.open_files.insert(fh.0, of);
                         reply.error(Errno::EINVAL);
                         return;
                     }
@@ -1589,49 +1701,23 @@ impl Filesystem for CasFuseFs {
                 Ok(new_pos)
             }
             FileState::FuseOnlyClean { object_id } => {
-                let id = *object_id;
-                let size = match g.daemon.get_entry(of.path.clone()) {
+                let _id = *object_id;
+                let size = match daemon.get_entry(of.path.clone()) {
                     Ok(Some(entry)) => entry.metadata.size,
                     Ok(None) => 0,
                     Err(_) => {
-                        g.open_files.insert(fh.0, of);
                         reply.error(Errno::EIO);
                         return;
                     }
                 };
-
-                if whence == 1 {
-                    if let Err(code) = of.write_at(0, &[], &root, &mut g.daemon) {
-                        g.open_files.insert(fh.0, of);
-                        reply.error(errno(code));
-                        return;
-                    }
-                    if let FileState::FuseOnlyDirtyRanged {
-                        logical_size,
-                        truncate_to,
-                        ..
-                    } = &mut of.state
-                    {
-                        let current = truncate_to.unwrap_or(*logical_size);
-                        let new_pos = (current as i64).saturating_add(offset).max(0) as u64;
-                        *logical_size = new_pos;
-                        *truncate_to = Some(new_pos);
-                        g.open_files.insert(fh.0, of);
-                        reply.offset(new_pos as i64);
-                        return;
-                    }
-                }
-
                 let new_pos = match whence {
                     0 => offset as u64,
                     1 => {
-                        g.open_files.insert(fh.0, of);
                         reply.error(Errno::EPERM);
                         return;
                     }
                     2 => (size as i64).saturating_add(offset) as u64,
                     _ => {
-                        g.open_files.insert(fh.0, of);
                         reply.error(Errno::EINVAL);
                         return;
                     }
@@ -1649,7 +1735,6 @@ impl Filesystem for CasFuseFs {
                     1 => (size as i64).saturating_add(offset).max(0) as u64,
                     2 => (size as i64).saturating_add(offset) as u64,
                     _ => {
-                        g.open_files.insert(fh.0, of);
                         reply.error(Errno::EINVAL);
                         return;
                     }
@@ -1659,8 +1744,6 @@ impl Filesystem for CasFuseFs {
                 Ok(new_pos)
             }
         };
-
-        g.open_files.insert(fh.0, of);
 
         match result {
             Ok(pos) => reply.offset(pos as i64),
@@ -1696,6 +1779,17 @@ impl Filesystem for CasFuseFs {
 
         let access = self.policy.classify(&path);
         let mut merged: BTreeMap<Vec<u8>, (PathBuf, FileType)> = BTreeMap::new();
+        let mut daemon = if !matches!(access, AccessMode::Passthrough) {
+            match g.connect_daemon() {
+                Ok(d) => Some(d),
+                Err(code) => {
+                    reply.error(errno(code));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
 
         if !matches!(access, AccessMode::FuseOnly) {
             let real = g.real_path(&path);
@@ -1718,17 +1812,19 @@ impl Filesystem for CasFuseFs {
         }
 
         if !matches!(access, AccessMode::Passthrough) {
-            if let Ok(entries) = g.daemon.read_dir_all(path.clone()) {
-                for (child_path, entry) in entries {
-                    let Some(name) = child_path.file_name() else {
-                        continue;
-                    };
-                    if entry.entry_type == EntryType::Whiteout {
-                        merged.remove(name.as_bytes());
-                        continue;
-                    }
-                    if let Some(kind) = kind_from_entry(&entry) {
-                        merged.insert(name.as_bytes().to_vec(), (child_path, kind));
+            if let Some(daemon) = daemon.as_mut() {
+                if let Ok(entries) = daemon.read_dir_all(path.clone()) {
+                    for (child_path, entry) in entries {
+                        let Some(name) = child_path.file_name() else {
+                            continue;
+                        };
+                        if entry.entry_type == EntryType::Whiteout {
+                            merged.remove(name.as_bytes());
+                            continue;
+                        }
+                        if let Some(kind) = kind_from_entry(&entry) {
+                            merged.insert(name.as_bytes().to_vec(), (child_path, kind));
+                        }
                     }
                 }
             }
@@ -1775,7 +1871,7 @@ impl Filesystem for CasFuseFs {
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
         let g = self.lock();
-        match nix::sys::statvfs::statvfs(&g.root) {
+        match nix::sys::statvfs::statvfs(g.root.as_path()) {
             Ok(stat) => {
                 reply.statfs(
                     stat.blocks() as u64,
@@ -1862,21 +1958,27 @@ impl Filesystem for CasFuseFs {
         mode: i32,
         reply: ReplyEmpty,
     ) {
-        let mut g = self.lock();
+        let mut daemon = match self.connect_daemon() {
+            Ok(d) => d,
+            Err(code) => {
+                reply.error(errno(code));
+                return;
+            }
+        };
+        let g = self.lock();
         if g.path_of(ino).is_none() {
             reply.error(Errno::ENOENT);
             return;
         }
-
-        let mut of = match g.open_files.remove(&fh.0) {
-            Some(v) => v,
+        let root = g.root.clone();
+        let mut of = match g.open_files.get_mut(&fh.0) {
+            Some(of) => of,
             None => {
                 reply.error(Errno::EBADF);
                 return;
             }
         };
-
-        let root = g.root.clone();
+        let of_path = of.path.clone();
         let res = match &mut of.state {
             FileState::Passthrough { file } => {
                 let fd = file.as_raw_fd();
@@ -1904,7 +2006,6 @@ impl Filesystem for CasFuseFs {
                         match file.seek(SeekFrom::Start(end)) {
                             Ok(_) => {}
                             Err(e) => {
-                                g.open_files.insert(fh.0, of);
                                 reply.error(errno(io_errno(&e)));
                                 return;
                             }
@@ -1912,7 +2013,6 @@ impl Filesystem for CasFuseFs {
                         match file.write_all(&[0]) {
                             Ok(_) => {}
                             Err(e) => {
-                                g.open_files.insert(fh.0, of);
                                 reply.error(errno(io_errno(&e)));
                                 return;
                             }
@@ -1922,7 +2022,6 @@ impl Filesystem for CasFuseFs {
                         match file.seek(SeekFrom::Start(current_size)) {
                             Ok(_) => {}
                             Err(e) => {
-                                g.open_files.insert(fh.0, of);
                                 reply.error(errno(io_errno(&e)));
                                 return;
                             }
@@ -1931,7 +2030,6 @@ impl Filesystem for CasFuseFs {
                         match file.write_all(&zeros) {
                             Ok(_) => {}
                             Err(e) => {
-                                g.open_files.insert(fh.0, of);
                                 reply.error(errno(io_errno(&e)));
                                 return;
                             }
@@ -1944,20 +2042,18 @@ impl Filesystem for CasFuseFs {
                 object_id: object_id_opt,
             } => {
                 let size = if let Some(id) = *object_id_opt {
-                    match g.daemon.get_object(id) {
+                    match daemon.get_object(id) {
                         Ok(bytes) => bytes.len() as u64,
                         Err(_) => {
-                            g.open_files.insert(fh.0, of);
                             reply.error(Errno::EIO);
                             return;
                         }
                     }
                 } else {
-                    let real_path = root.join(of.path.strip_prefix("/").unwrap_or(&of.path));
+                    let real_path = root.join(of_path.strip_prefix("/").unwrap_or(&of_path));
                     match std::fs::metadata(&real_path) {
                         Ok(meta) => meta.len(),
                         Err(_) => {
-                            g.open_files.insert(fh.0, of);
                             reply.error(Errno::EIO);
                             return;
                         }
@@ -1968,10 +2064,10 @@ impl Filesystem for CasFuseFs {
                     let mode_keep_size = mode & libc::FALLOC_FL_KEEP_SIZE as i32;
                     if mode_keep_size != 0 {
                         if let Some(id) = *object_id_opt {
-                            if let Ok(mut bytes) = g.daemon.get_object(id) {
+                            if let Ok(mut bytes) = daemon.get_object(id) {
                                 bytes.resize(end as usize, 0);
-                                let _ = g.daemon.put_file(
-                                    of.path.clone(),
+                                let _ = daemon.put_file(
+                                    of_path.clone(),
                                     bytes.clone(),
                                     crate::syncing::proto::FileMetadata {
                                         size: bytes.len() as u64,
@@ -1990,11 +2086,9 @@ impl Filesystem for CasFuseFs {
                 Ok(())
             }
             FileState::FuseOnlyClean { object_id } => {
-                let id = *object_id;
-                let size = match g.daemon.get_object(id) {
+                let size = match daemon.get_object(*object_id) {
                     Ok(bytes) => bytes.len() as u64,
                     Err(_) => {
-                        g.open_files.insert(fh.0, of);
                         reply.error(Errno::EIO);
                         return;
                     }
@@ -2003,10 +2097,10 @@ impl Filesystem for CasFuseFs {
                 if end > size {
                     let mode_keep_size = mode & libc::FALLOC_FL_KEEP_SIZE as i32;
                     if mode_keep_size != 0 {
-                        if let Ok(mut bytes) = g.daemon.get_object(id) {
+                        if let Ok(mut bytes) = daemon.get_object(*object_id) {
                             bytes.resize(end as usize, 0);
-                            let _ = g.daemon.put_file(
-                                of.path.clone(),
+                            let _ = daemon.put_file(
+                                of_path.clone(),
                                 bytes.clone(),
                                 crate::syncing::proto::FileMetadata {
                                     size: bytes.len() as u64,
@@ -2032,13 +2126,11 @@ impl Filesystem for CasFuseFs {
                 let mode_keep_size = mode & libc::FALLOC_FL_KEEP_SIZE as i32;
                 if mode_keep_size == 0 {
                     *logical_size = (*logical_size).max(end);
-                    *truncate_to = Some((*truncate_to).unwrap_or(*logical_size).max(end));
+                    *truncate_to = Some(truncate_to.unwrap_or(*logical_size).max(end));
                 }
                 Ok(())
             }
         };
-
-        g.open_files.insert(fh.0, of);
 
         match res {
             Ok(()) => reply.ok(),

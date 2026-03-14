@@ -32,7 +32,7 @@ impl InodeTable {
     ///
     /// `path` must be an absolute path; a `debug_assert` enforces this in
     /// debug builds.
-    pub fn get_or_insert(&mut self, path: &Path) -> u64 {
+    pub fn get_or_insert(&self, path: &Path) -> u64 {
         debug_assert!(path.is_absolute(), "path must be absolute: {:?}", path);
         if let Some(ino) = self.path_to_ino.get(path) {
             return *ino;

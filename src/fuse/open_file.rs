@@ -34,7 +34,6 @@ pub enum FileState {
     },
     FuseOnlyDirtyRanged {
         object_id: u64,
-        base_size: u64,
         patches: Vec<BytePatch>,
         truncate_to: Option<u64>,
         logical_size: u64,
@@ -253,7 +252,6 @@ impl OpenFile {
                 object_id,
                 patches,
                 truncate_to,
-                base_size,
                 logical_size,
             } => {
                 let effective_size = truncate_to.unwrap_or(*logical_size);
@@ -345,7 +343,6 @@ impl OpenFile {
                 let write_end = offset.saturating_add(data.len() as u64);
                 self.state = FileState::FuseOnlyDirtyRanged {
                     object_id: id,
-                    base_size,
                     patches: vec![BytePatch {
                         offset,
                         data: data.to_vec(),
