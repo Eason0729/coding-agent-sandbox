@@ -32,15 +32,9 @@ impl SyncClientPool {
 3. If pool is at capacity, wait on a condition variable until another checkout is dropped.
 4. Dropping `PooledSyncClient` returns the connection to idle queue and notifies one waiter.
 
-## Capacity Rule (Deadlock Prevention)
+## Capacity Rule (Resource Management)
 
-The FUSE client-pool capacity must be bounded by syncing daemon worker concurrency.
-
-- If pool capacity is larger than server worker count, a burst can occupy many accepted
-  sockets while only a few are serviced. Requests then wait on unscheduled connections,
-  which can stall interactive shells (`bash`) during completion/probe fanout.
-- Therefore the caller should pass `max_size = worker_count` (current worker count is
-  `min(4, available_parallelism)`), instead of a fixed larger value.
+The FUSE client-pool capacity should be reasonable for the expected concurrency (e.g., 4-8 connections). The server now uses thread-per-connection, so worker starvation is no longer a concern. However, unbounded connection growth should still be prevented to avoid resource exhaustion.
 
 ## Error Handling
 

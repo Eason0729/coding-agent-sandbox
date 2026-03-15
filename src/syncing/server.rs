@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
@@ -28,12 +30,87 @@ pub fn default_worker_count() -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    use tempfile::tempdir;
+
     use super::default_worker_count;
+    use crate::syncing::proto::Request;
 
     #[test]
     fn default_worker_count_is_bounded() {
         let n = default_worker_count();
         assert!((1..=4).contains(&n));
+    }
+
+    #[test]
+    fn thread_per_connection_allows_concurrent_clients() {
+        let td = tempdir().expect("tempdir");
+        let sock = td.path().join("daemon.sock");
+        let listener = UnixListener::bind(&sock).expect("bind listener");
+        listener.set_nonblocking(true).expect("set nonblocking");
+
+        let active_requests = Arc::new(AtomicUsize::new(0));
+        let running = Arc::new(AtomicBool::new(true));
+
+        let active_clone = Arc::clone(&active_requests);
+        let running_clone = Arc::clone(&running);
+
+        let _handle = thread::spawn(move || {
+            while running_clone.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((_stream, _)) => {
+                        // Just accept connections
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let idle_count = 4;
+        let mut idle_conns = Vec::new();
+        for _ in 0..idle_count {
+            let conn = UnixStream::connect(&sock).expect("connect idle");
+            idle_conns.push(conn);
+        }
+
+        let active_clone2 = Arc::clone(&active_clone);
+        let _active_conn = thread::spawn(move || {
+            let mut conn = UnixStream::connect(&sock).expect("connect active");
+            active_clone2.fetch_add(1, Ordering::SeqCst);
+
+            let req = postcard::to_allocvec(&Request::GetEntry {
+                path: PathBuf::from("/test"),
+            })
+            .unwrap();
+            let len = (req.len() as u32).to_le_bytes();
+            conn.write_all(&len).unwrap();
+            conn.write_all(&req).unwrap();
+            conn.flush().unwrap();
+
+            let mut len_buf = [0u8; 4];
+            conn.read_exact(&mut len_buf).unwrap();
+        });
+
+        thread::sleep(Duration::from_millis(100));
+
+        assert!(
+            active_requests.load(Ordering::SeqCst) > 0,
+            "active request should have been served despite idle connections"
+        );
+
+        running.store(false, Ordering::Relaxed);
+        drop(idle_conns);
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -175,34 +252,6 @@ fn bind_listener(sock_path: &Path) -> std::io::Result<UnixListener> {
     Ok(listener)
 }
 
-/// Spawn bounded request workers that each serve one connection at a time.
-fn spawn_workers(
-    state: Arc<ServerState>,
-    rx: Arc<Mutex<mpsc::Receiver<UnixStream>>>,
-    thread_count: usize,
-) -> Vec<thread::JoinHandle<()>> {
-    let mut workers = Vec::with_capacity(thread_count);
-    for _ in 0..thread_count {
-        let state_ref = Arc::clone(&state);
-        let rx_ref = Arc::clone(&rx);
-        workers.push(thread::spawn(move || loop {
-            let stream = {
-                let guard = rx_ref.lock().unwrap();
-                guard.recv()
-            };
-
-            let Ok(stream) = stream else {
-                break;
-            };
-
-            if let Err(e) = handle_connection(state_ref.as_ref(), stream) {
-                log::error!("sync.conn event=serve_failed error={e}");
-            }
-        }));
-    }
-    workers
-}
-
 /// Finalize daemon state and remove socket path.
 fn flush_and_remove_socket(state: &ServerState, sock_path: &Path) {
     let (meta, fuse_map) = snapshot_state(state);
@@ -212,18 +261,29 @@ fn flush_and_remove_socket(state: &ServerState, sock_path: &Path) {
     let _ = std::fs::remove_file(sock_path);
 }
 
-/// Accept loop with delegated shutdown decision.
+/// Accept loop with thread-per-connection model.
+/// Each incoming connection gets its own dedicated thread, ensuring idle persistent
+/// connections never block other connections from making progress.
 fn run_accept_loop<P: PollLock>(
     listener: &UnixListener,
-    tx: &mpsc::Sender<UnixStream>,
     state: &Arc<ServerState>,
     sock_path: &Path,
     poll_lock: &mut P,
+    shutdown_flag: &Arc<AtomicBool>,
 ) -> bool {
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
-                let _ = tx.send(stream);
+                let state_ref = Arc::clone(state);
+                let shutdown_flag_ref = Arc::clone(shutdown_flag);
+                thread::spawn(move || {
+                    if let Err(e) = handle_connection(&state_ref, stream) {
+                        log::error!("sync.conn event=serve_failed error={e}");
+                    }
+                    if shutdown_flag_ref.load(Ordering::Acquire) {
+                        log::debug!("sync.conn event=connection_shutdown");
+                    }
+                });
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(10));
@@ -265,19 +325,14 @@ pub fn run<P: PollLock>(sandbox_dir: PathBuf, ready: impl FnOnce(), poll_lock: &
     ready();
     log::info!("sync.start event=ready socket={}", sock_path.display());
 
-    let thread_count = default_worker_count();
-    log::debug!("sync.start event=workers count={thread_count}");
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
 
-    let (tx, rx) = mpsc::channel::<UnixStream>();
-    let rx = Arc::new(Mutex::new(rx));
-    let workers = spawn_workers(Arc::clone(&state), Arc::clone(&rx), thread_count);
+    let shutdown_committed =
+        run_accept_loop(&listener, &state, &sock_path, poll_lock, &shutdown_flag);
 
-    let shutdown_committed = run_accept_loop(&listener, &tx, &state, &sock_path, poll_lock);
+    shutdown_flag.store(true, Ordering::Release);
 
-    drop(tx);
-    for worker in workers {
-        let _ = worker.join();
-    }
+    thread::sleep(Duration::from_millis(100));
 
     if !shutdown_committed {
         flush_and_remove_socket(state.as_ref(), &sock_path);

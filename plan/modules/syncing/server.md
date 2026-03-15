@@ -13,11 +13,15 @@ Implement the syncing daemon server — `syncing/server/objects.rs`, `syncing/se
 
 ## Accept Loop
 
-Multi-threaded request handling:
+Thread-per-connection model:
 
 1. Main thread accepts `UnixStream` connections.
-2. Streams are dispatched to a bounded worker pool sized as `min(4, available_parallelism)`.
-3. Each worker runs `handle_connection` for one stream and serves framed requests until EOF.
+2. For each incoming connection, spawn a dedicated thread to run `handle_connection` until EOF.
+3. Each connection is fully independent — idle persistent connections (from client connection pools) never block other connections.
+
+**Why not bounded worker pool:** The previous bounded worker pool model could cause worker starvation when multiple sandbox instances ran concurrently. Each persistent client connection (from `SyncClientPool`) holds a worker thread indefinitely while waiting for future requests. With only 4 workers, one sandbox's pool could occupy all workers, leaving another sandbox's connection requests unscheduled.
+
+Thread-per-connection ensures every incoming connection makes progress regardless of other connections' state.
 
 ## Concurrency and Locking
 
@@ -37,13 +41,14 @@ These are the canonical write path for FUSE dirty ranged files.
 
 ## Shutdown
 
-Shutdown is triggered when `shm_state.running_count` reaches 0 (checked after each `handle_connection`).
+Shutdown is triggered when `shm_state.running_count` reaches 0, polled in the main accept loop (not per-connection thread).
 
 **Shutdown steps:**
-1. Break the accept loop.
-2. Call `disk::flush(sandbox_dir, &meta, &fuse_map)` (equivalent to handling a `Flush` request).
-3. Remove `daemon.sock`.
-4. Exit the process.
+1. Break the accept loop (main thread).
+2. Send shutdown signal to all active connection threads (optional: let them finish current request).
+3. Call `disk::flush(sandbox_dir, &meta, &fuse_map)` (equivalent to handling a `Flush` request).
+4. Remove `daemon.sock`.
+5. Exit the process.
 
 ## Error Handling
 
