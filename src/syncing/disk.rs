@@ -8,6 +8,8 @@ use thiserror::Error;
 
 use crate::syncing::proto::FuseEntry;
 
+const SUPPORTED_ABI_VERSION: u32 = 3;
+
 #[derive(Error, Debug)]
 pub enum DiskError {
     #[error("IO error: {0}")]
@@ -16,6 +18,8 @@ pub enum DiskError {
     Serialize(#[from] postcard::Error),
     #[error("Object error: {0}")]
     Object(#[from] crate::syncing::object::ObjectError),
+    #[error("ABI version mismatch: found {found}, expected {expected}. Run `cas clean && cas init` to reinitialize.")]
+    AbiMismatch { found: u32, expected: u32 },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -66,11 +70,18 @@ pub fn load(sandbox_dir: &PathBuf) -> Result<(SandboxMeta, FuseMap), DiskError> 
         let mut file = File::open(&meta_path)?;
         let mut data = Vec::new();
         file.read_to_end(&mut data)?;
-        postcard::from_bytes(&data)?
+        let meta: SandboxMeta = postcard::from_bytes(&data)?;
+        if meta.abi_version != SUPPORTED_ABI_VERSION {
+            return Err(DiskError::AbiMismatch {
+                found: meta.abi_version,
+                expected: SUPPORTED_ABI_VERSION,
+            });
+        }
+        meta
     } else {
         SandboxMeta {
             shm_name: String::new(),
-            abi_version: 2,
+            abi_version: SUPPORTED_ABI_VERSION,
             next_id: 1,
         }
     };
@@ -124,11 +135,59 @@ pub fn init_sandbox(sandbox_dir: &PathBuf, shm_name: &str) -> Result<(), DiskErr
 
     let meta = SandboxMeta {
         shm_name: shm_name.to_string(),
-        abi_version: 2,
+        abi_version: SUPPORTED_ABI_VERSION,
         next_id: 1,
     };
     let fuse_map = FuseMap::default();
     flush(sandbox_dir, &meta, &fuse_map)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_load_rejects_old_abi() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+
+        let old_meta = SandboxMeta {
+            shm_name: "test".to_string(),
+            abi_version: 2,
+            next_id: 1,
+        };
+        let old_fuse_map = FuseMap::default();
+
+        let meta_path = dir.join(".sandbox").join("data").join("metadata.bin");
+        let map_path = dir.join(".sandbox").join("data").join("data.bin");
+        fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(map_path.parent().unwrap()).unwrap();
+        fs::write(&meta_path, postcard::to_allocvec(&old_meta).unwrap()).unwrap();
+        fs::write(&map_path, postcard::to_allocvec(&old_fuse_map).unwrap()).unwrap();
+
+        let result = load(&dir);
+        assert!(matches!(
+            result,
+            Err(DiskError::AbiMismatch {
+                found: 2,
+                expected: 3
+            })
+        ));
+    }
+
+    #[test]
+    fn test_load_accepts_current_abi() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+
+        init_sandbox(&dir, "test").unwrap();
+
+        let result = load(&dir);
+        assert!(result.is_ok());
+        let (meta, _) = result.unwrap();
+        assert_eq!(meta.abi_version, 3);
+    }
 }

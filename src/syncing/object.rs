@@ -77,8 +77,8 @@ impl ObjectStore {
 
     fn object_path(&self, id: u64) -> PathBuf {
         let hex = format!("{:016x}", id);
-        let prefix = &hex[0..2];
-        self.dir.join(prefix).join(hex)
+        let shard = format!("{:02x}", id & 0xff);
+        self.dir.join(shard).join(hex)
     }
 
     pub fn init_dir(dir: &PathBuf) -> Result<(), ObjectError> {
@@ -87,5 +87,59 @@ impl ObjectStore {
             fs::create_dir_all(&subdir)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_sharding_distributes_ids() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        ObjectStore::init_dir(&dir).unwrap();
+
+        let mut store = ObjectStore::new(dir, 1);
+
+        let mut shards = std::collections::HashSet::new();
+        for _ in 0..512 {
+            let id = store.put(b"test").unwrap();
+            shards.insert(id & 0xff);
+        }
+
+        assert!(
+            shards.len() > 1,
+            "Expected distribution across multiple shards, got {}",
+            shards.len()
+        );
+    }
+
+    #[test]
+    fn test_object_path_low_byte_shard() {
+        let tmp = TempDir::new().unwrap();
+        let store = ObjectStore::new(tmp.path().to_path_buf(), 0);
+
+        assert_eq!(
+            store.object_path(0),
+            tmp.path().join("00").join("0000000000000000")
+        );
+        assert_eq!(
+            store.object_path(1),
+            tmp.path().join("01").join("0000000000000001")
+        );
+        assert_eq!(
+            store.object_path(255),
+            tmp.path().join("ff").join("00000000000000ff")
+        );
+        assert_eq!(
+            store.object_path(256),
+            tmp.path().join("00").join("0000000000000100")
+        );
+        assert_eq!(
+            store.object_path(0x0001_00ff),
+            tmp.path().join("ff").join("00000000000100ff")
+        );
     }
 }

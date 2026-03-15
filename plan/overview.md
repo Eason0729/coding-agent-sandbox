@@ -110,7 +110,7 @@ src/
     ├── data/
     │   ├── metadata.bin      postcard: SandboxMetadata (shm_name, abi_version, next_id)
     │   ├── data.bin          postcard: HashMap<path, FileMetadata>
-    │   └── objects/          raw content blobs named by decimal object ID
+    │   └── objects/          raw content blobs: objects/<shard>/<id_hex> (shard = low byte)
     ├── config.toml           whitelist/ignorelist/blocklist glob arrays
     ├── access.log            first-access audit log (plain text)
     ├── .gitignore            git ignore for access.log and data

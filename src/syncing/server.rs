@@ -22,6 +22,7 @@ pub fn default_worker_count() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
+        .min(4)
         .max(1)
 }
 

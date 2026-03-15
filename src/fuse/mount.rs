@@ -19,6 +19,7 @@ pub fn run_fuse(fs: CasFuseFs, mountpoint: &Path) -> io::Result<()> {
     let thread_count = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
+        .min(4)
         .max(1);
 
     config.n_threads = Some(thread_count);

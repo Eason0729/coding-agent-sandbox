@@ -22,7 +22,7 @@ The original spec placed `access.log` at `.sandbox/access.log`, but the syncing 
     ├── data/
     │   ├── metadata.bin      postcard: SandboxMetadata (shm_name, abi_version, next_id)
     │   ├── data.bin          postcard: HashMap<path, FileMetadata>
-    │   ├── objects/          raw content blobs named by decimal object ID
+    │   ├── objects/          raw content blobs: objects/<shard>/<id_hex> (shard = low byte)
     │   └── access.log        first-access audit log (plain text) - NOTE: in data/, not .sandbox/
     ├── config.toml           whitelist/ignorelist/blocklist glob arrays
     ├── .gitignore            git ignore for access.log and data

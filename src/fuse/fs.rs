@@ -2188,4 +2188,15 @@ impl Filesystem for CasFuseFs {
             Err(code) => reply.error(errno(code)),
         }
     }
+
+    fn fsyncdir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
 }

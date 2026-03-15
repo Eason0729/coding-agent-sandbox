@@ -114,21 +114,3 @@ reply.statfs(
     stat.fragment_size() as u32,
 );
 ```
-
-### Cloning CasFuseFs
-
-The `Filesystem` trait methods take `&self`, so we need `Arc<Mutex<...>>` for interior mutability:
-
-```rust
-pub struct CasFuseFs {
-    inner: Arc<Mutex<CasFuseInner>>,
-}
-
-impl Clone for CasFuseFs {
-    fn clone(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-}
-```
