@@ -326,7 +326,6 @@ impl Clone for CasFuseFs {
 impl Filesystem for CasFuseFs {
     fn init(&mut self, req: &Request, config: &mut KernelConfig) -> io::Result<()> {
         const FLAGS: &[InitFlags] = &[
-            InitFlags::FUSE_ASYNC_READ,
             InitFlags::FUSE_WRITEBACK_CACHE,
             InitFlags::FUSE_READDIRPLUS_AUTO,
             InitFlags::FUSE_DO_READDIRPLUS,
