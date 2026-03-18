@@ -28,13 +28,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize a new sandbox in the current directory
+    /// Initialize or reset sandbox (creates if not exists, cleans if exists)
     Init,
-    /// Remove FUSE data and reset SHM
+    /// Clean data directory or initialize sandbox if not exists
     Clean,
     /// Delete entire .sandbox directory
     Purge,
-    /// Run a command inside the sandbox
+    /// Run a command inside the sandbox (auto-initializes if not exists)
     #[command(name = "run")]
     Run {
         /// The command and arguments to run

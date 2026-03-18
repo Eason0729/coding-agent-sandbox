@@ -1,18 +1,23 @@
 Implement `cas init` — create the `.sandbox/` directory tree and generate persistent identity metadata.
 
+## Behavior
+
+`cas init` performs the same operation as `cas clean`. It will:
+- Initialize sandbox if `.sandbox/` does not exist
+- Clean data and reset SHM if `.sandbox/` already exists
+
 ## Implementation Notes (Divergences from Original Spec)
 
 ### access.log Location
 
 The original spec placed `access.log` at `.sandbox/access.log`, but the syncing server expects it at `.sandbox/data/access.log`. The implementation follows the server's expectation.
 
-**Steps:**
-1. Fail if `.sandbox/` already exists (no implicit reset)
-2. Create `.sandbox/data/objects/`
-3. Generate random `shm_name` (`cas-` + alphanumeric)
-4. Write default `config.toml` (empty lists)
-5. Create empty `access.log`
-6. Create `.gitignore` to ignore `.sandbox/data/` contents
+**Steps (when initializing):**
+1. Create `.sandbox/data/objects/`
+2. Generate random `shm_name` (`cas-` + alphanumeric)
+3. Write default `config.toml` (empty lists)
+4. Create empty `access.log`
+5. Create `.gitignore` to ignore `.sandbox/data/` contents
 
 ## Data Layout
 

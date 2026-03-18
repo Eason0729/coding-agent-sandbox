@@ -1,10 +1,10 @@
 # CAS — Coding Agent Sandbox
 
-A rootless filesystem sandbox for safely running untrusted programs (AI coding agents) using FUSE. Built in Rust.
+Run your claude safely, no setup, REAL sandbox
 
 ## What Is CAS?
 
-`cas` runs untrusted code inside a controlled filesystem environment without requiring root privileges or container runtimes. It intercepts filesystem operations using FUSE and enforces per-path read/write/block policies:
+`cas` runs untrusted code inside a controlled filesystem environment and container runtimes. It intercepts filesystem operations using FUSE and enforces per-path read/write/block policies:
 
 - **Write**: Full access
 - **Read**: Agents has full access to files, but redirect write to `./sandbox/data`(CoW).
@@ -15,8 +15,7 @@ A rootless filesystem sandbox for safely running untrusted programs (AI coding a
 - **Rootless**: No root or container runtime required
 - **Copy-on-write**: Writes to untracked files go to a private FUSE store
 - **Config**: Change the filesystem policy whatever you want.
-- **Out-of-box isolation**: Isolate only what you need(Pid/filesystem), network is NOT isolated by default.
-- **Multi-instance coordination**: Uses POSIX SHM to coordinate multiple concurrent sandbox instances.
+- **Multi-instance coordination**: Coordinate multiple concurrent sandbox instances.
 
 ## Installation
 
@@ -47,10 +46,10 @@ Coding Agent Sandbox — filesystem isolation tool
 Usage: cas [OPTIONS] <COMMAND>
 
 Commands:
-  init   Initialize a new sandbox in the current directory
-  clean  Remove FUSE data and reset SHM
+  init   Initialize or reset sandbox (creates if not exists, cleans if exists)
+  clean  Clean data directory or initialize sandbox if not exists
   purge  Delete entire .sandbox directory
-  run    Run a command inside the sandbox
+  run    Run a command inside the sandbox (auto-initializes if not exists)
 
 Options:
   -r, --root <ROOT>  Project root directory (defaults to current directory) [default: .]
@@ -58,6 +57,9 @@ Options:
 ```
 
 ## Requirements
+
+> [!IMPORTANT]
+> This container is linux only!
 
 - Linux kernel with FUSE support
 - Rust toolchain

@@ -243,7 +243,9 @@ fn wait_for_daemon_ready(shm: &ShmState, daemon_socket: &Path, timeout: Duration
 fn prepare_context(project_root: &Path) -> Result<RunContext> {
     let sandbox_dir = project_root.join(".sandbox");
     if !sandbox_dir.exists() {
-        return Err(RunError::NotInitialized);
+        log::info!("run.lifecycle event=auto_init");
+        crate::cli::cmd_clean(project_root)
+            .map_err(|e| RunError::Io(std::io::Error::other(e.to_string())))?;
     }
 
     let (meta, _fuse_map) = crate::syncing::disk::load(&project_root.to_path_buf())?;

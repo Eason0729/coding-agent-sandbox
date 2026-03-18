@@ -1,5 +1,9 @@
 Implement `cas run` — load metadata and config, manage SHM lifecycle, fork syncing daemon on 0→1, wait for socket readiness, launch the sandbox, and propagate the exit code.
 
+## Auto-Initialization
+
+If `.sandbox/` does not exist, `cas run` will automatically initialize the sandbox before proceeding (same behavior as `cas clean`).
+
 ## Implementation Notes (Divergences from Original Spec)
 
 The original specification contained some details that did not match the actual implementation. The following corrections were made during implementation:
