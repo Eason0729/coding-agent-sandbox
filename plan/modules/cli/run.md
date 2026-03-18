@@ -195,9 +195,12 @@ Already described above - forks the syncing daemon.
 
 ### Step 2: Second Fork (setup(1))
 
-After syncing daemon is ready, fork to create the setup(1) process:
+After syncing daemon is ready, fork to create the setup(1) process. The controlling TTY path is captured **before** the fork using `ttyname(&std::io::stdin())` and passed through `SetupPayload`:
 
 ```rust
+// Capture controlling TTY before fork (in run_in_sandbox)
+let controlling_tty = ttyname(&std::io::stdin()).ok();
+
 match fork() {
     Ok(ForkResult::Child) => {
         // setup(1) process - creates user namespace and mount namespace
@@ -227,8 +230,8 @@ match fork() {
                 // Wait for FUSE to be ready (poll mountpoint)
                 wait_for_fuse_ready(&mountpoint);
                 
-                // Prepare chroot with /dev, /proc, fuse mount
-                prepare_chroot(&rootfs, &mountpoint)?;
+                // Prepare chroot with /dev, /proc, fuse mount, and /dev/tty
+                prepare_chroot(&rootfs, &mountpoint, &cwd, &controlling_tty)?;
                 
                 // Chroot, apply seccomp, drop caps, exec
                 chroot_and_exec(&rootfs, &mut cmd)?;
@@ -242,6 +245,8 @@ match fork() {
     Err(e) => return Err(e),
 }
 ```
+
+The `SetupPayload` struct includes `controlling_tty: Option<PathBuf>` which carries the controlling TTY path from the parent process to the sandboxed process.
 
 ### Key Points
 

@@ -1,4 +1,5 @@
 use std::ffi::CString;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -6,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use log;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{fork, ForkResult, Pid};
+use nix::unistd::{fork, ttyname, ForkResult, Pid};
 use thiserror::Error;
 
 use crate::config::{Config, ConfigPolicy};
@@ -72,6 +73,7 @@ struct SetupPayload {
     daemon_socket: PathBuf,
     cmd_argv: Vec<String>,
     policy: Arc<dyn Policy>,
+    controlling_tty: Option<PathBuf>,
 }
 
 /// RAII lease for the `running_count` slot.
@@ -381,7 +383,12 @@ fn run_setup_stage2(payload: SetupPayload, fuse_child: Pid) -> ! {
         std::process::exit(1);
     }
 
-    if let Err(e) = prepare_chroot(&payload.rootfs, &payload.mountpoint, &payload.cwd) {
+    if let Err(e) = prepare_chroot(
+        &payload.rootfs,
+        &payload.mountpoint,
+        &payload.cwd,
+        &payload.controlling_tty,
+    ) {
         log::error!("setup2 event=prepare_chroot_failed error={e}");
         std::process::exit(1);
     }
@@ -445,6 +452,8 @@ fn run_in_sandbox(ctx: &RunContext, cmd_args: &[String]) -> Result<i32> {
     let rootfs = tempfile::tempdir()?;
     let mountpoint = tempfile::tempdir()?;
 
+    let controlling_tty = ttyname(&std::io::stdin()).ok();
+
     let payload = SetupPayload {
         rootfs: rootfs.path().to_path_buf(),
         mountpoint: mountpoint.path().to_path_buf(),
@@ -452,6 +461,7 @@ fn run_in_sandbox(ctx: &RunContext, cmd_args: &[String]) -> Result<i32> {
         daemon_socket: ctx.daemon_socket.clone(),
         cmd_argv: cmd_args.to_vec(),
         policy: Arc::clone(&ctx.policy),
+        controlling_tty,
     };
 
     let child_pid = spawn_setup_process(payload)?;

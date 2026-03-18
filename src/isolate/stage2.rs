@@ -45,7 +45,12 @@ pub fn create_mount_ns() -> Result<()> {
     Ok(())
 }
 
-pub fn prepare_chroot(rootfs: &Path, mountpoint: &Path, cwd: &Path) -> Result<()> {
+pub fn prepare_chroot(
+    rootfs: &Path,
+    mountpoint: &Path,
+    cwd: &Path,
+    controlling_tty: &Option<PathBuf>,
+) -> Result<()> {
     // Pre-create the mountpoint directories and device file placeholders on the
     // real tempdir BEFORE binding FUSE at the rootfs root.  The FUSE bind-mount
     // will shadow the tempdir contents, but we need the kernel to see the
@@ -63,7 +68,7 @@ pub fn prepare_chroot(rootfs: &Path, mountpoint: &Path, cwd: &Path) -> Result<()
 
     // 2. Stack real /proc and /dev nodes on top of FUSE.
     bind_mount_proc(rootfs)?;
-    bind_mount_dev(rootfs)?;
+    bind_mount_dev(rootfs, controlling_tty)?;
 
     // 3. chroot into the prepared rootfs.
     chroot(rootfs).map_err(|e| Stage2Error::Chroot {
@@ -126,7 +131,7 @@ fn bind_mount_proc(rootfs: &Path) -> Result<()> {
     })
 }
 
-fn bind_mount_dev(rootfs: &Path) -> Result<()> {
+fn bind_mount_dev(rootfs: &Path, controlling_tty: &Option<PathBuf>) -> Result<()> {
     let dev_devices = ["null", "zero", "urandom", "random"];
     let dev_target = rootfs.join("dev");
 
@@ -143,6 +148,23 @@ fn bind_mount_dev(rootfs: &Path) -> Result<()> {
         )
         .map_err(|e| Stage2Error::Mount {
             src: source,
+            tgt: target.display().to_string(),
+            err: e,
+        })?;
+    }
+
+    if let Some(tty_path) = controlling_tty {
+        let target = dev_target.join("tty");
+        let tty_path_str: String = tty_path.to_string_lossy().into_owned();
+        mount(
+            Some(tty_path_str.as_str()),
+            &target,
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .map_err(|e| Stage2Error::Mount {
+            src: tty_path.to_string_lossy().into_owned(),
             tgt: target.display().to_string(),
             err: e,
         })?;
