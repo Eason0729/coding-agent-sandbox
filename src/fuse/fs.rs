@@ -14,9 +14,9 @@ use dashmap::{DashMap, DashSet};
 
 use fuser::{
     AccessFlags, CopyFileRangeFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
-    INodeNo, InitFlags, KernelConfig, LockOwner, OpenFlags, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyLseek, ReplyOpen, ReplyStatfs,
-    ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
+    INodeNo, InitFlags, KernelConfig, LockOwner, OpenFlags, PollEvents, PollNotifier, ReplyAttr,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyLseek,
+    ReplyOpen, ReplyPoll, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 
 use crate::fuse::attr::{attr_from_daemon, attr_from_meta};
@@ -326,6 +326,7 @@ impl Clone for CasFuseFs {
 impl Filesystem for CasFuseFs {
     fn init(&mut self, req: &Request, config: &mut KernelConfig) -> io::Result<()> {
         const FLAGS: &[InitFlags] = &[
+            InitFlags::FUSE_ASYNC_READ,
             InitFlags::FUSE_WRITEBACK_CACHE,
             InitFlags::FUSE_READDIRPLUS_AUTO,
             InitFlags::FUSE_DO_READDIRPLUS,
@@ -2334,5 +2335,69 @@ impl Filesystem for CasFuseFs {
         reply: ReplyEmpty,
     ) {
         reply.ok();
+    }
+
+    fn poll(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        _ph: PollNotifier,
+        events: PollEvents,
+        _flags: fuser::PollFlags,
+        reply: ReplyPoll,
+    ) {
+        let g = self.lock();
+        if g.path_of(ino).is_none() {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+
+        let mut of = match g.open_files.get_mut(&fh.0) {
+            Some(of) => of,
+            None => {
+                reply.error(Errno::EBADF);
+                return;
+            }
+        };
+
+        let revents = match &mut of.state {
+            FileState::Passthrough { file } => {
+                let fd = file.as_raw_fd();
+                let mut pollfd = libc::pollfd {
+                    fd,
+                    events: events.bits() as i16,
+                    revents: 0,
+                };
+                let ret = unsafe { libc::poll(&mut pollfd, 1, 0) };
+                if ret < 0 {
+                    reply.error(errno(libc::EIO));
+                    return;
+                }
+                PollEvents::from_bits_truncate(pollfd.revents as u32)
+            }
+            FileState::CowDirty { tmp, .. }
+            | FileState::FuseOnlyDirty { tmp, .. }
+            | FileState::FuseOnlyNew { tmp } => {
+                let file = tmp_as_file(tmp);
+                let fd = file.as_raw_fd();
+                let mut pollfd = libc::pollfd {
+                    fd,
+                    events: events.bits() as i16,
+                    revents: 0,
+                };
+                let ret = unsafe { libc::poll(&mut pollfd, 1, 0) };
+                if ret < 0 {
+                    reply.error(errno(libc::EIO));
+                    return;
+                }
+                PollEvents::from_bits_truncate(pollfd.revents as u32)
+            }
+            FileState::CowClean { .. }
+            | FileState::FuseOnlyClean { .. }
+            | FileState::FuseOnlyDirtyRanged { .. } => PollEvents::POLLIN | PollEvents::POLLOUT,
+        };
+
+        reply.poll(revents);
     }
 }
