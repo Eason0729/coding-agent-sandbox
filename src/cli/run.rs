@@ -244,7 +244,7 @@ fn prepare_context(project_root: &Path) -> Result<RunContext> {
     let sandbox_dir = project_root.join(".sandbox");
     if !sandbox_dir.exists() {
         log::info!("run.lifecycle event=auto_init");
-        crate::cli::cmd_clean(project_root)
+        crate::cli::cmd_clean(project_root, true)
             .map_err(|e| RunError::Io(std::io::Error::other(e.to_string())))?;
     }
 

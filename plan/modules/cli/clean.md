@@ -6,6 +6,17 @@ Implement `cas clean` — clean data directory or initialize sandbox if not exis
 - If `.sandbox/` does not exist: initialize sandbox with default config
 - If `.sandbox/` exists: remove fuse data and reset SHM
 
+## Options
+
+- `--force`, `-f`: Force clean even if daemon is running (default: false)
+
+## Daemon Check
+
+When not using `--force`:
+1. Check if `daemon.sock` exists
+2. Try to connect to the socket to verify daemon is running
+3. If daemon is running, abort with error: "daemon is running. Use --force to clean anyway"
+
 ## Steps (when cleaning)
 
 1. Load metadata to get `shm_name` before removing data

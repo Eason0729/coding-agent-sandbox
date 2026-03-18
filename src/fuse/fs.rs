@@ -15,8 +15,8 @@ use dashmap::{DashMap, DashSet};
 use fuser::{
     AccessFlags, CopyFileRangeFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
     INodeNo, InitFlags, KernelConfig, LockOwner, OpenFlags, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite,
-    ReplyXattr, Request, TimeOrNow, WriteFlags,
+    ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyLseek, ReplyOpen, ReplyStatfs,
+    ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 
 use crate::fuse::attr::{attr_from_daemon, attr_from_meta};
@@ -325,6 +325,18 @@ impl Clone for CasFuseFs {
 
 impl Filesystem for CasFuseFs {
     fn init(&mut self, req: &Request, config: &mut KernelConfig) -> io::Result<()> {
+        const FLAGS: &[InitFlags] = &[
+            InitFlags::FUSE_ASYNC_READ,
+            InitFlags::FUSE_WRITEBACK_CACHE,
+            InitFlags::FUSE_READDIRPLUS_AUTO,
+            InitFlags::FUSE_DO_READDIRPLUS,
+            InitFlags::FUSE_WRITEBACK_CACHE,
+            InitFlags::FUSE_BIG_WRITES,
+            InitFlags::FUSE_PARALLEL_DIROPS,
+        ];
+        for flag in FLAGS {
+            config.add_capabilities(*flag).ok();
+        }
         let caps = config.capabilities();
         log::debug!(
             "fuse.init pid={} uid={} gid={} caps={:?} atomic_o_trunc={} no_open_support={}",
@@ -1903,6 +1915,131 @@ impl Filesystem for CasFuseFs {
                 continue;
             }
             if reply.add(entry_ino, (idx + 1) as u64, kind, OsStr::from_bytes(&name)) {
+                break;
+            }
+        }
+        reply.ok();
+    }
+
+    fn readdirplus(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectoryPlus,
+    ) {
+        let mut g = self.lock();
+        let path = match g.path_of(ino) {
+            Some(p) => p,
+            None => {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+        };
+
+        let access = self.policy.classify(&path);
+        let mut merged: BTreeMap<Vec<u8>, (PathBuf, FileType)> = BTreeMap::new();
+        let mut daemon = if !matches!(access, AccessMode::Passthrough) {
+            match g.connect_daemon() {
+                Ok(d) => Some(d),
+                Err(code) => {
+                    reply.error(errno(code));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        if !matches!(access, AccessMode::FuseOnly) {
+            let real = g.real_path(&path);
+            if let Ok(dir) = fs::read_dir(&real) {
+                for entry in dir.flatten() {
+                    let name = entry.file_name();
+                    let full = normalize_abs(&path.join(&name));
+                    if let Ok(meta) = entry.metadata() {
+                        let kind = if meta.file_type().is_dir() {
+                            FileType::Directory
+                        } else if meta.file_type().is_symlink() {
+                            FileType::Symlink
+                        } else {
+                            FileType::RegularFile
+                        };
+                        merged.insert(name.as_bytes().to_vec(), (full, kind));
+                    }
+                }
+            }
+        }
+
+        if !matches!(access, AccessMode::Passthrough) {
+            if let Some(daemon) = daemon.as_mut() {
+                if let Ok(entries) = daemon.read_dir_all(path.clone()) {
+                    for (child_path, entry) in entries {
+                        let Some(name) = child_path.file_name() else {
+                            continue;
+                        };
+                        if entry.entry_type == EntryType::Whiteout {
+                            merged.remove(name.as_bytes());
+                            continue;
+                        }
+                        if let Some(kind) = kind_from_entry(&entry) {
+                            merged.insert(name.as_bytes().to_vec(), (child_path, kind));
+                        }
+                    }
+                }
+            }
+        }
+
+        let parent_path = path.parent().unwrap_or(Path::new("/")).to_path_buf();
+        let parent_ino = INodeNo(g.inodes.get_or_insert(&parent_path));
+
+        let mut entries: Vec<(INodeNo, FileType, Vec<u8>)> = Vec::new();
+        entries.push((ino, FileType::Directory, b".".to_vec()));
+        entries.push((parent_ino, FileType::Directory, b"..".to_vec()));
+
+        for (_name, (child_path, kind)) in merged {
+            let child_ino = INodeNo(g.inodes.get_or_insert(&child_path));
+            let child_name = child_path
+                .file_name()
+                .map(OsStr::as_bytes)
+                .unwrap_or_default()
+                .to_vec();
+            entries.push((child_ino, kind, child_name));
+        }
+
+        for (idx, (entry_ino, kind, name)) in entries.into_iter().enumerate() {
+            if (idx as u64) < offset {
+                continue;
+            }
+            let child_path = if name == b"." {
+                path.clone()
+            } else if name == b".." {
+                parent_path.clone()
+            } else {
+                path.join(OsStr::from_bytes(&name))
+            };
+            let mode = self.policy.classify(&child_path);
+            let attr = if let Some(daemon) = daemon.as_mut() {
+                match g.stat_path(&child_path, &mode, daemon) {
+                    Ok((_, a)) => a,
+                    Err(_) => continue,
+                }
+            } else {
+                let real = g.real_path(&child_path);
+                match fs::symlink_metadata(&real) {
+                    Ok(meta) => attr_from_meta(g.inodes.get_or_insert(&child_path), &meta),
+                    Err(_) => continue,
+                }
+            };
+            if reply.add(
+                entry_ino,
+                (idx + 1) as u64,
+                OsStr::from_bytes(&name),
+                &TTL,
+                &attr,
+                fuser::Generation(0),
+            ) {
                 break;
             }
         }

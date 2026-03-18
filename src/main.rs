@@ -31,7 +31,11 @@ enum Commands {
     /// Initialize or reset sandbox (creates if not exists, cleans if exists)
     Init,
     /// Clean data directory or initialize sandbox if not exists
-    Clean,
+    Clean {
+        /// Force clean even if daemon is running
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Delete entire .sandbox directory
     Purge,
     /// Run a command inside the sandbox (auto-initializes if not exists)
@@ -56,8 +60,8 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Clean => {
-            if let Err(e) = cli::cmd_clean(&root) {
+        Commands::Clean { force } => {
+            if let Err(e) = cli::cmd_clean(&root, force) {
                 log::error!("cas clean: {}", e);
                 std::process::exit(1);
             }

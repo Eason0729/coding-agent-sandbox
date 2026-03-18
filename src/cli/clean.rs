@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 use rand::distributions::Alphanumeric;
@@ -11,9 +12,18 @@ pub enum CleanError {
     Meta(#[from] crate::syncing::disk::DiskError),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("daemon is running. Use --force to clean anyway")]
+    DaemonRunning,
 }
 
-pub fn cmd_clean(project_root: &Path) -> Result<(), CleanError> {
+fn is_daemon_running(sock_path: &Path) -> bool {
+    if !sock_path.exists() {
+        return false;
+    }
+    UnixStream::connect(sock_path).is_ok()
+}
+
+pub fn cmd_clean(project_root: &Path, force: bool) -> Result<(), CleanError> {
     let sandbox_dir = project_root.join(".sandbox");
 
     if !sandbox_dir.exists() {
@@ -45,6 +55,11 @@ pub fn cmd_clean(project_root: &Path) -> Result<(), CleanError> {
         return Ok(());
     }
 
+    let sock_path = sandbox_dir.join("daemon.sock");
+    if !force && is_daemon_running(&sock_path) {
+        return Err(CleanError::DaemonRunning);
+    }
+
     let meta_result = crate::syncing::disk::load(&project_root.to_path_buf());
 
     let data_dir = sandbox_dir.join("data");
@@ -63,7 +78,6 @@ pub fn cmd_clean(project_root: &Path) -> Result<(), CleanError> {
         }
     }
 
-    let sock_path = sandbox_dir.join("daemon.sock");
     if sock_path.exists() {
         let _ = fs::remove_file(&sock_path);
     }
