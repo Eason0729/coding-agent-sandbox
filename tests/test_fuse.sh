@@ -79,6 +79,26 @@ check_eq "CoW write is readable from inside sandbox" "coowritten" "$OUT"
 REAL2=$(cat "$COW_EXT2")
 check_eq "real file still unchanged after CoW write-read" "original" "$REAL2"
 
+# ── Test 1d: CoW append-after-write must not fail with EBADF ───────────────────
+echo ""
+echo "=== Test 1d: CoW append after write (Bug 002 regression) ==="
+
+COW_APP="$TMP/cow_append.txt"
+rm -f "$COW_APP"
+
+# Step 1: create file via write redirection
+run_in "$PROJECT" bash -c "echo 'first' > '$COW_APP'" 2>/dev/null || true
+# Step 2: read it back
+OUT1=$(run_in "$PROJECT" cat "$COW_APP" 2>/dev/null || true)
+check_eq "first write readable" "first" "$OUT1"
+# Step 3: append to it (this used to fail with EBADF due to backing reuse)
+OUT2=$(run_in "$PROJECT" bash -c "echo 'second' >> '$COW_APP' && cat '$COW_APP'" 2>/dev/null || true)
+check_eq "append write succeeds and content is correct" "first
+second" "$OUT2"
+# Verify real file unchanged
+REAL_APP=$(cat "$COW_APP" 2>/dev/null || true)
+check_eq "real file unchanged after append" "" "$REAL_APP"
+
 # ── Test 1c: CoW new file — touch non-existent file ─────────────────────────────
 echo ""
 echo "=== Test 1c: CoW new file — touch non-existent file in CoW area ==="

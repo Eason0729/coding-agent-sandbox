@@ -61,6 +61,7 @@ impl SyncClient {
     }
 
     pub fn get_object_path(&mut self, id: u64) -> Result<PathBuf, ClientError> {
+        // todo: infer object path without hitting unix socket
         let response = self.send_request(Request::GetObjectPath { id })?;
         match response {
             Response::GetObjectPath { path } => Ok(path),

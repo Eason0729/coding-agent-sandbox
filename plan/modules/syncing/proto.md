@@ -37,35 +37,3 @@ struct FuseEntry {
     symlink_target: Option<Vec<u8>>,
 }
 ```
-
-## Request/response list
-
-| Intent | Request | Response |
-|---|---|---|
-| ensure regular file has backing object | `EnsureFileObject { path, meta }` | `EnsureFileObject { id, path }` |
-| map object id to real object path | `GetObjectPath { id }` | `GetObjectPath { path }` or `NotFound` |
-| explicit file entry upsert | `UpsertFileEntry { path, object_id, meta }` | `UpsertFileEntry` |
-| update metadata only | `PutFileMeta { path, meta }` | `PutFileMeta` |
-| fetch metadata only | `GetFileMeta { path }` | `GetFileMeta(Option<FileMetadata>)` |
-| lookup exact path entry | `GetEntry { path }` | `GetEntry(Option<FuseEntry>)` |
-| remove exact path entry | `DeleteFile { path }` | `DeleteFile` |
-| rename exact path | `RenameFile { from, to }` | `RenameFile` |
-| upsert directory entry | `PutDir { path, meta }` | `PutDir` |
-| upsert symlink entry | `PutSymlink { path, target, meta }` | `PutSymlink` |
-| place exact-path tombstone | `PutWhiteout { path }` | `PutWhiteout` |
-| remove exact-path tombstone | `DeleteWhiteout { path }` | `DeleteWhiteout` |
-| list direct children entries | `ReadDirAll { path }` | `DirEntries(Vec<(PathBuf, FuseEntry)>)` |
-| list descendant whiteouts | `ListWhiteoutUnder { path }` | `WhiteoutPaths(Vec<PathBuf>)` |
-| rename subtree entries | `RenameTree { from, to }` | `RenameTree` |
-| append access log | `LogAccess { path, operation, pid }` | `LogAccess` |
-| persist daemon state | `Flush` | `Flush` |
-
-## Merge/whiteout semantics
-
-- Whiteout is exact-path hide marker.
-- A managed directory does not implicitly hide its subtree.
-- Readdir merge is done in FUSE layer; server only returns direct children entries.
-
-## Derive bounds
-
-All protocol types derive `serde::Serialize + serde::Deserialize + Debug`.

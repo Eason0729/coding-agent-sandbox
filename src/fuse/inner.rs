@@ -5,8 +5,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use dashmap::{DashMap, DashSet};
-use fuser::{BackingId, FileAttr, FileType, INodeNo};
+use dashmap::DashMap;
+use fuser::{FileAttr, FileType, INodeNo};
 
 use crate::{
     error::{Error, Result},
@@ -85,7 +85,6 @@ pub(super) fn normalize_abs(path: &Path) -> PathBuf {
 pub struct Inner {
     pub(super) inodes: InodeTable,
     pub(super) open_files: DashMap<u64, OpenFile>,
-    pub(super) backing_ids: DashMap<PathBuf, std::sync::Arc<BackingId>>,
     pub(super) next_fh: AtomicU64,
     pub(super) mount_uid: u32,
     pub(super) mount_gid: u32,
@@ -103,7 +102,6 @@ impl Inner {
         Self {
             inodes,
             open_files: DashMap::new(),
-            backing_ids: DashMap::new(),
             next_fh: AtomicU64::new(1),
             mount_uid,
             mount_gid,

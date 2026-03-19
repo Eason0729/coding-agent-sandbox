@@ -11,6 +11,10 @@ Stage 1 runs in the setup(1) process (the second fork child, after the syncing d
 3. Map the current host GID to the same GID inside the namespace
 4. Keep the mapping so that the sandboxed process has its own UID/GID scope but retains the same numeric UID/GID
 
+> This way file inside have mapping:
+> - same user to same user
+> - other to nobody
+
 The identity mapping provides namespace isolation without elevated privileges
 
 ## Lifetime

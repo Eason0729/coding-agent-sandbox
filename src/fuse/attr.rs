@@ -36,7 +36,7 @@ pub fn attr_from_meta(ino: u64, meta: &std::fs::Metadata) -> FileAttr {
     let ctime = system_time_from_unix_i64(meta.ctime());
 
     fn map_nobody(uid: u32) -> u32 {
-        if uid == 65534 {
+        if uid >= 65534 {
             0
         } else {
             uid

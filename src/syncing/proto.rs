@@ -121,3 +121,18 @@ impl Response {
         Response::Error(msg.into())
     }
 }
+
+impl FuseEntry {
+    pub fn is_whiteout(&self) -> bool {
+        self.entry_type == EntryType::Whiteout
+    }
+    pub fn is_file(&self) -> bool {
+        self.entry_type == EntryType::File
+    }
+    pub fn is_dir(&self) -> bool {
+        self.entry_type == EntryType::Dir
+    }
+    pub fn is_symlink(&self) -> bool {
+        self.entry_type == EntryType::Symlink
+    }
+}

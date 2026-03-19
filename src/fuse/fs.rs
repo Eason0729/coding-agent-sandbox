@@ -14,7 +14,7 @@ use fuser::*;
 
 use crate::error::{Error, Result};
 use crate::fuse::inner::Inner;
-use crate::fuse::open_file::{FileState, OpenFile, TTL};
+use crate::fuse::open_file::{OpenFile, TTL};
 use crate::fuse::policy::{AccessMode, Policy};
 use crate::syncing::proto::{EntryType, FileMetadata};
 
@@ -34,6 +34,33 @@ fn err_to_errno(err: &Error) -> Errno {
             crate::syncing::ClientError::Server(_) => Errno::EIO,
         },
     }
+}
+
+macro_rules! solve_error {
+    ($reply: ident, $err: expr) => {
+        match ($err) {
+            Ok(_) => {
+                $reply.ok();
+                return;
+            }
+            Err(err) => {
+                $reply.error(err);
+                return;
+            }
+        }
+    };
+}
+
+macro_rules! reply_error {
+    ($reply:expr, $err: expr) => {
+        match ($err) {
+            Ok(v) => v,
+            Err(err) => {
+                $reply.error(err);
+                return;
+            }
+        }
+    };
 }
 
 #[derive(Clone)]
@@ -185,12 +212,6 @@ impl CasFuseFs {
         }
         out
     }
-
-    fn file_from_openfile(of: &mut OpenFile) -> &mut std::fs::File {
-        match &mut of.state {
-            FileState::PassthroughReal { file } | FileState::PassthroughObject { file, .. } => file,
-        }
-    }
 }
 
 /// Check if component is a `export`(man page term)
@@ -275,13 +296,7 @@ impl Filesystem for CasFuseFs {
 
     fn getattr(&self, req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         self.req_start(req, "getattr", None, &format!("ino={}", ino.0));
-        let path = match self.path_of(ino) {
-            Some(p) => p,
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-        };
+        let path = reply_error!(reply, self.path_of(ino).ok_or(Errno::ENOENT));
 
         match self.stat_path(&path) {
             Ok((_kind, attr)) => reply.attr(&TTL, &attr),
@@ -307,33 +322,23 @@ impl Filesystem for CasFuseFs {
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        let path = match self.path_of(ino) {
-            Some(p) => p,
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-        };
+        let path = reply_error!(reply, self.path_of(ino).ok_or(Errno::ENOENT));
 
-        let mut daemon = match self.connect_daemon() {
-            Ok(v) => v,
-            Err(err) => {
-                reply.error(err_to_errno(&err));
-                return;
-            }
-        };
+        let mut client = reply_error!(
+            reply,
+            self.connect_daemon().map_err(|err| err_to_errno(&err))
+        );
 
         if let Some(fh) = fh {
             if let Some(mut of) = self.open_files.get_mut(&fh.0) {
-                let file = Self::file_from_openfile(&mut of);
                 if let Some(sz) = size {
-                    if let Err(e) = file.set_len(sz) {
+                    if let Err(e) = of.as_mut().set_len(sz) {
                         reply.error(Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO)));
                         return;
                     }
                 }
                 if mode.is_some() || uid.is_some() || gid.is_some() {
-                    let mut perms = match file.metadata() {
+                    let mut perms = match of.as_mut().metadata() {
                         Ok(m) => m.permissions(),
                         Err(e) => {
                             reply.error(Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO)));
@@ -342,17 +347,17 @@ impl Filesystem for CasFuseFs {
                     };
                     if let Some(m) = mode {
                         perms.set_mode(m & 0o7777);
-                        let _ = file.set_permissions(perms);
+                        let _ = of.as_mut().set_permissions(perms);
                     }
                     let _ = nix::unistd::fchown(
-                        file.as_raw_fd(),
+                        of.as_mut().as_raw_fd(),
                         uid.map(nix::unistd::Uid::from_raw),
                         gid.map(nix::unistd::Gid::from_raw),
                     );
                 }
-                if let Ok(meta) = file.metadata() {
+                if let Ok(meta) = of.as_mut().metadata() {
                     let fmeta = Self::meta_from_stat(&meta);
-                    let _ = daemon.put_file_meta(path.clone(), fmeta);
+                    let _ = client.put_file_meta(path.clone(), fmeta);
                 }
                 match self.stat_path(&path) {
                     Ok((_k, attr)) => reply.attr(&TTL, &attr),
@@ -386,7 +391,7 @@ impl Filesystem for CasFuseFs {
                 }
             }
             AccessMode::FuseOnly | AccessMode::CopyOnWrite => {
-                if let Ok(Some(mut m)) = daemon.get_file_meta(path.clone()) {
+                if let Ok(Some(mut m)) = client.get_file_meta(path.clone()) {
                     if let Some(v) = mode {
                         m.mode = (m.mode & !0o7777) | (v & 0o7777);
                     }
@@ -400,7 +405,7 @@ impl Filesystem for CasFuseFs {
                         m.size = v;
                     }
                     m.ctime = Self::now_unix();
-                    let _ = daemon.put_file_meta(path.clone(), m);
+                    let _ = client.put_file_meta(path.clone(), m);
                 }
             }
         }
@@ -412,21 +417,13 @@ impl Filesystem for CasFuseFs {
     }
 
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
-        let path = match self.path_of(ino) {
-            Some(p) => p,
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-        };
-        let mut daemon = match self.connect_daemon() {
-            Ok(v) => v,
-            Err(err) => {
-                reply.error(err_to_errno(&err));
-                return;
-            }
-        };
-        match daemon.get_entry(path.clone()) {
+        let path = reply_error!(reply, self.path_of(ino).ok_or(Errno::ENOENT));
+
+        let mut client = reply_error!(
+            reply,
+            self.connect_daemon().map_err(|err| err_to_errno(&err))
+        );
+        match client.get_entry(path.clone()) {
             Ok(Some(entry)) if entry.entry_type == EntryType::Symlink => {
                 let data = entry.symlink_target.unwrap_or_default();
                 reply.data(&data);
@@ -451,13 +448,10 @@ impl Filesystem for CasFuseFs {
         reply: ReplyEntry,
     ) {
         let path = get_path!(self, reply, parent, name);
-        let mut daemon = match self.connect_daemon() {
-            Ok(v) => v,
-            Err(err) => {
-                reply.error(err_to_errno(&err));
-                return;
-            }
-        };
+        let mut client = reply_error!(
+            reply,
+            self.connect_daemon().map_err(|err| err_to_errno(&err))
+        );
         match self.policy.classify(&path) {
             AccessMode::Passthrough => {
                 let res = fs::create_dir(&path).and_then(|_| {
@@ -471,11 +465,11 @@ impl Filesystem for CasFuseFs {
             AccessMode::FuseOnly | AccessMode::CopyOnWrite => {
                 let meta =
                     Self::file_meta_now(0, libc::S_IFDIR | (mode & 0o7777), req.uid(), req.gid());
-                if let Err(err) = daemon.put_dir(path.clone(), meta) {
+                if let Err(err) = client.put_dir(path.clone(), meta) {
                     reply.error(err_to_errno(&Error::from(err)));
                     return;
                 }
-                let _ = daemon.delete_whiteout(path.clone());
+                let _ = client.delete_whiteout(path.clone());
             }
         }
 
@@ -508,21 +502,18 @@ impl Filesystem for CasFuseFs {
 
     fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let path = get_path!(self, reply, parent, name);
-        let mut daemon = match self.connect_daemon() {
-            Ok(v) => v,
-            Err(err) => {
-                reply.error(err_to_errno(&err));
-                return;
-            }
-        };
+        let mut client = reply_error!(
+            reply,
+            self.connect_daemon().map_err(|err| err_to_errno(&err))
+        );
         match self.policy.classify(&path) {
             AccessMode::Passthrough => match fs::remove_file(&path) {
                 Ok(()) => reply.ok(),
                 Err(e) => reply.error(Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO))),
             },
             AccessMode::FuseOnly | AccessMode::CopyOnWrite => {
-                let _ = daemon.delete_file(path.clone());
-                match daemon.put_whiteout(path) {
+                let _ = client.delete_file(path.clone());
+                match client.put_whiteout(path) {
                     Ok(()) => reply.ok(),
                     Err(err) => reply.error(err_to_errno(&Error::from(err))),
                 }
@@ -536,10 +527,11 @@ impl Filesystem for CasFuseFs {
         let access = self.policy.classify(&path);
 
         match access {
-            AccessMode::Passthrough => match fs::remove_dir(&path) {
-                Ok(()) => reply.ok(),
-                Err(e) => reply.error(Errno::from_i32(e.raw_os_error().unwrap_or_default())),
-            },
+            AccessMode::Passthrough => solve_error!(
+                reply,
+                fs::remove_dir(&path)
+                    .map_err(|e| Errno::from_i32(e.raw_os_error().unwrap_or_default()))
+            ),
             AccessMode::FuseOnly | AccessMode::CopyOnWrite => {
                 let mut daemon = match self.connect_daemon() {
                     Ok(v) => v,
@@ -575,34 +567,30 @@ impl Filesystem for CasFuseFs {
         let from = get_path!(self, reply, parent, name);
         let to = get_path!(self, reply, newparent, newname);
         match self.policy.classify(&from) {
-            AccessMode::Passthrough => match fs::rename(&from, &to) {
-                Ok(()) => reply.ok(),
-                Err(e) => reply.error(Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO))),
-            },
+            AccessMode::Passthrough => solve_error!(
+                reply,
+                fs::rename(&from, &to)
+                    .map_err(|e| Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO)))
+            ),
             AccessMode::FuseOnly | AccessMode::CopyOnWrite => {
-                let mut daemon = match self.connect_daemon() {
-                    Ok(v) => v,
-                    Err(err) => {
-                        reply.error(err_to_errno(&err));
-                        return;
-                    }
-                };
-                let is_dir = daemon
+                let mut client = reply_error!(
+                    reply,
+                    self.connect_daemon().map_err(|err| err_to_errno(&err))
+                );
+
+                let is_dir = client
                     .get_entry(from.clone())
                     .ok()
                     .flatten()
                     .map(|e| e.entry_type == EntryType::Dir)
                     .unwrap_or(false);
                 let res = if is_dir {
-                    daemon.rename_tree(from.clone(), to.clone())
+                    client.rename_tree(from.clone(), to.clone())
                 } else {
-                    daemon.rename_file(from.clone(), to.clone())
+                    client.rename_file(from.clone(), to.clone())
                 };
-                if let Err(err) = res {
-                    reply.error(err_to_errno(&Error::from(err)));
-                    return;
-                }
-                let _ = daemon.delete_whiteout(to);
+                reply_error!(reply, res.map_err(|err| err_to_errno(&Error::from(err))));
+                client.delete_whiteout(to).ok();
                 reply.ok();
             }
         }
@@ -618,34 +606,30 @@ impl Filesystem for CasFuseFs {
     ) {
         let path = get_path!(self, reply, parent, name);
         match self.policy.classify(&path) {
-            AccessMode::Passthrough => match std::os::unix::fs::symlink(target, &path) {
-                Ok(()) => {}
-                Err(e) => {
-                    reply.error(Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO)));
-                    return;
-                }
-            },
+            AccessMode::Passthrough => reply_error!(
+                reply,
+                std::os::unix::fs::symlink(target, &path)
+                    .map_err(|e| Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO)))
+            ),
             AccessMode::FuseOnly | AccessMode::CopyOnWrite => {
-                let mut daemon = match self.connect_daemon() {
-                    Ok(v) => v,
-                    Err(err) => {
-                        reply.error(err_to_errno(&err));
-                        return;
-                    }
-                };
+                let mut client = reply_error!(
+                    reply,
+                    self.connect_daemon().map_err(|err| err_to_errno(&err))
+                );
                 let meta = Self::file_meta_now(
                     target.as_os_str().as_bytes().len() as u64,
                     libc::S_IFLNK | 0o777,
                     req.uid(),
                     req.gid(),
                 );
-                if let Err(err) =
-                    daemon.put_symlink(path.clone(), target.as_os_str().as_bytes().to_vec(), meta)
-                {
-                    reply.error(err_to_errno(&Error::from(err)));
-                    return;
-                }
-                let _ = daemon.delete_whiteout(path.clone());
+
+                reply_error!(
+                    reply,
+                    client
+                        .put_symlink(path.clone(), target.as_os_str().as_bytes().to_vec(), meta)
+                        .map_err(|err| err_to_errno(&Error::from(err)))
+                );
+                client.delete_whiteout(path.clone()).ok();
             }
         }
         match self.stat_path(&path) {
@@ -674,169 +658,99 @@ impl Filesystem for CasFuseFs {
             }
         };
         self.req_start(req, "open", Some(&path), "");
+        let mut client = reply_error!(
+            reply,
+            self.connect_daemon().map_err(|err| err_to_errno(&err))
+        );
+        let access = self.policy.classify(&path);
         let raw_flags = flags.0;
-        let mut daemon = match self.connect_daemon() {
-            Ok(v) => v,
-            Err(err) => {
-                reply.error(err_to_errno(&err));
-                return;
+
+        let need_write = matches!(
+            flags.acc_mode(),
+            OpenAccMode::O_RDWR | OpenAccMode::O_WRONLY
+        );
+
+        let entry = reply_error!(
+            reply,
+            client
+                .get_entry(path.clone())
+                .map_err(|err| err_to_errno(&Error::from(err)))
+        );
+        if entry
+            .as_ref()
+            .map_or(false, |e| e.entry_type == EntryType::Whiteout)
+        {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+
+        let object_id = entry.as_ref().and_then(|x| x.object_id);
+        let object_path = object_id.and_then(|id| client.get_object_path(id).ok());
+
+        macro_rules! ensure {
+            ($opt:expr, $field:tt) => {
+                match $opt {
+                    Some(v) => v,
+                    None => {
+                        let meta =
+                            Self::file_meta_now(0, libc::S_IFREG | 0o644, req.uid(), req.gid());
+                        reply_error!(
+                            reply,
+                            client
+                                .ensure_file_object(path.clone(), meta)
+                                .map_err(|e| err_to_errno(&Error::from(e)))
+                        )
+                        .$field
+                    }
+                }
+            };
+        }
+
+        let (target_path, object_id) = match access {
+            AccessMode::Passthrough => (path.clone(), None),
+            AccessMode::FuseOnly => {
+                let oid = ensure!(object_id, 0);
+                let p = ensure!(object_path, 1);
+                (p, Some(oid))
+            }
+            AccessMode::CopyOnWrite => {
+                if !need_write {
+                    (path.clone(), None)
+                } else {
+                    let oid = ensure!(object_id, 0);
+                    let p = ensure!(object_path, 1);
+                    let _ = client.delete_whiteout(path.clone());
+                    (p, Some(oid))
+                }
             }
         };
-        let access = self.policy.classify(&path);
 
-        let state = match access {
-            AccessMode::Passthrough => match Self::open_options_from_flags(raw_flags).open(&path) {
-                Ok(file) => FileState::PassthroughReal { file },
-                Err(e) => {
-                    reply.error(Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO)));
-                    return;
-                }
+        let file = reply_error!(
+            reply,
+            Self::open_options_from_flags(raw_flags)
+                .open(&target_path)
+                .map_err(|e| Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO)))
+        );
+        let state = match object_id {
+            Some(id) => OpenFile::PassthroughObject {
+                file,
+                object_id: id,
             },
-            AccessMode::FuseOnly | AccessMode::CopyOnWrite => {
-                let entry = match daemon.get_entry(path.clone()) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        reply.error(err_to_errno(&Error::from(err)));
-                        return;
-                    }
-                };
-                if let Some(e) = entry {
-                    if e.entry_type == EntryType::Whiteout {
-                        reply.error(Errno::ENOENT);
-                        return;
-                    }
-                    if let Some(oid) = e.object_id {
-                        match daemon.get_object_path(oid) {
-                            Ok(object_path) => {
-                                match Self::open_options_from_flags(raw_flags).open(&object_path) {
-                                    Ok(file) => FileState::PassthroughObject {
-                                        file,
-                                        object_id: oid,
-                                    },
-                                    Err(err) => {
-                                        reply.error(Errno::from_i32(
-                                            err.raw_os_error().unwrap_or(libc::EIO),
-                                        ));
-                                        return;
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                reply.error(err_to_errno(&Error::from(err)));
-                                return;
-                            }
-                        }
-                    } else {
-                        match Self::open_options_from_flags(raw_flags).open(&path) {
-                            Ok(file) => FileState::PassthroughReal { file },
-                            Err(err) => {
-                                reply.error(Errno::from_i32(
-                                    err.raw_os_error().unwrap_or(libc::EIO),
-                                ));
-                                return;
-                            }
-                        }
-                    }
-                } else if access == AccessMode::CopyOnWrite && !Self::has_write_intent(raw_flags) {
-                    match Self::open_options_from_flags(raw_flags).open(&path) {
-                        Ok(file) => FileState::PassthroughReal { file },
-                        Err(err) => {
-                            reply.error(Errno::from_i32(err.raw_os_error().unwrap_or(libc::EIO)));
-                            return;
-                        }
-                    }
-                } else {
-                    if let Ok(stat) = fs::symlink_metadata(&path) {
-                        let meta = Self::meta_from_stat(&stat);
-                        let (oid, object_path) = match daemon.ensure_file_object(path.clone(), meta)
-                        {
-                            Ok(v) => v,
-                            Err(err) => {
-                                reply.error(err_to_errno(&Error::from(err)));
-                                return;
-                            }
-                        };
-                        let real_len = stat.size();
-                        if let Ok(obj_meta) = fs::metadata(&object_path) {
-                            if obj_meta.len() == 0 && real_len > 0 {
-                                let _ = fs::copy(&path, &object_path);
-                            }
-                        }
-                        let _ = daemon.delete_whiteout(path.clone());
-                        match Self::open_options_from_flags(raw_flags).open(&object_path) {
-                            Ok(file) => FileState::PassthroughObject {
-                                file,
-                                object_id: oid,
-                            },
-                            Err(err) => {
-                                reply.error(Errno::from_i32(
-                                    err.raw_os_error().unwrap_or(libc::EIO),
-                                ));
-                                return;
-                            }
-                        }
-                    } else {
-                        let now_meta =
-                            Self::file_meta_now(0, libc::S_IFREG | 0o644, req.uid(), req.gid());
-                        let (oid, object_path) =
-                            match daemon.ensure_file_object(path.clone(), now_meta) {
-                                Ok(v) => v,
-                                Err(err) => {
-                                    reply.error(err_to_errno(&Error::from(err)));
-                                    return;
-                                }
-                            };
-                        let _ = daemon.delete_whiteout(path.clone());
-                        match Self::open_options_from_flags(raw_flags).open(&object_path) {
-                            Ok(file) => FileState::PassthroughObject {
-                                file,
-                                object_id: oid,
-                            },
-                            Err(e) => {
-                                reply.error(Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO)));
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
+            None => OpenFile::PassthroughReal { file },
         };
 
         let fh = self.alloc_fh();
-        let open_result = match &state {
-            FileState::PassthroughReal { file } | FileState::PassthroughObject { file, .. } => {
-                if let Some(existing) = self.inner.backing_ids.get(&path) {
-                    Ok(existing.clone())
-                } else {
-                    reply.open_backing(file).map(Arc::new)
-                }
+        let backing_id: Option<Arc<BackingId>> = match &state {
+            OpenFile::PassthroughReal { file } | OpenFile::PassthroughObject { file, .. } => {
+                reply.open_backing(file).map(Arc::new).ok()
             }
         };
-        self.open_files.insert(
-            fh,
-            OpenFile {
-                ino: self.inodes.get_or_insert(&path),
-                state,
-            },
-        );
-        match open_result {
-            Ok(backing_id) => {
-                self.inner
-                    .backing_ids
-                    .insert(path.clone(), backing_id.clone());
-                reply.opened_passthrough(
-                    FileHandle(fh),
-                    FopenFlags::FOPEN_PASSTHROUGH,
-                    &backing_id,
-                );
+        self.open_files.insert(fh, state);
+        match backing_id {
+            Some(id) => {
+                reply.opened_passthrough(FileHandle(fh), FopenFlags::FOPEN_PASSTHROUGH, &id)
             }
-            Err(_) => reply.opened(FileHandle(fh), FopenFlags::empty()),
-        }
-    }
-
-    fn forget(&self, _req: &Request, ino: INodeNo, _nlookup: u64) {
-        if let Some(path) = self.path_of(ino) {
-            self.inner.backing_ids.remove(&path);
+            None => reply.opened(FileHandle(fh), FopenFlags::empty()),
         }
     }
 
@@ -851,13 +765,10 @@ impl Filesystem for CasFuseFs {
         reply: ReplyCreate,
     ) {
         let path = get_path!(self, reply, parent, name);
-        let mut daemon = match self.connect_daemon() {
-            Ok(v) => v,
-            Err(err) => {
-                reply.error(err_to_errno(&err));
-                return;
-            }
-        };
+        let mut client = reply_error!(
+            reply,
+            self.connect_daemon().map_err(|err| err_to_errno(&err))
+        );
         let raw_flags = flags;
 
         let state = match self.policy.classify(&path) {
@@ -865,7 +776,7 @@ impl Filesystem for CasFuseFs {
                 let mut opts = Self::open_options_from_flags(raw_flags);
                 opts.create(true).mode(mode);
                 match opts.open(&path) {
-                    Ok(file) => FileState::PassthroughReal { file },
+                    Ok(file) => OpenFile::PassthroughReal { file },
                     Err(e) => {
                         reply.error(Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO)));
                         return;
@@ -875,18 +786,18 @@ impl Filesystem for CasFuseFs {
             AccessMode::FuseOnly | AccessMode::CopyOnWrite => {
                 let meta =
                     Self::file_meta_now(0, libc::S_IFREG | (mode & 0o7777), req.uid(), req.gid());
-                let (oid, object_path) = match daemon.ensure_file_object(path.clone(), meta) {
+                let (oid, object_path) = match client.ensure_file_object(path.clone(), meta) {
                     Ok(v) => v,
                     Err(err) => {
                         reply.error(err_to_errno(&Error::from(err)));
                         return;
                     }
                 };
-                let _ = daemon.delete_whiteout(path.clone());
+                let _ = client.delete_whiteout(path.clone());
                 let mut opts = Self::open_options_from_flags(raw_flags);
                 opts.create(true).mode(mode);
                 match opts.open(&object_path) {
-                    Ok(file) => FileState::PassthroughObject {
+                    Ok(file) => OpenFile::PassthroughObject {
                         file,
                         object_id: oid,
                     },
@@ -899,22 +810,12 @@ impl Filesystem for CasFuseFs {
         };
 
         let fh = self.alloc_fh();
-        let open_result = match &state {
-            FileState::PassthroughReal { file } | FileState::PassthroughObject { file, .. } => {
-                if let Some(existing) = self.inner.backing_ids.get(&path) {
-                    Ok(existing.clone())
-                } else {
-                    reply.open_backing(file).map(Arc::new)
-                }
+        let backing_id: Option<Arc<BackingId>> = match &state {
+            OpenFile::PassthroughReal { file } | OpenFile::PassthroughObject { file, .. } => {
+                reply.open_backing(file).map(Arc::new).ok()
             }
         };
-        self.open_files.insert(
-            fh,
-            OpenFile {
-                ino: self.inodes.get_or_insert(&path),
-                state,
-            },
-        );
+        self.open_files.insert(fh, state);
         let attr = match self.stat_path(&path) {
             Ok((_kind, attr)) => attr,
             Err(_) => {
@@ -938,21 +839,18 @@ impl Filesystem for CasFuseFs {
                 }
             }
         };
-        match open_result {
-            Ok(backing_id) => {
-                self.inner
-                    .backing_ids
-                    .insert(path.clone(), backing_id.clone());
+        match backing_id {
+            Some(id) => {
                 reply.created_passthrough(
                     &TTL,
                     &attr,
                     fuser::Generation(0),
                     FileHandle(fh),
                     FopenFlags::empty(),
-                    &backing_id,
+                    &id,
                 );
             }
-            Err(_) => reply.created(
+            None => reply.created(
                 &TTL,
                 &attr,
                 fuser::Generation(0),
@@ -1025,6 +923,7 @@ impl Filesystem for CasFuseFs {
             return;
         }
         let root = PathBuf::from_str("/").unwrap();
+        log::debug!("write debug offset={}, size={}", offset, data.len());
         let res = match self.open_files.get_mut(&fh.0) {
             Some(mut of) => of.write_at(offset, data, &root, &mut daemon),
             None => {
@@ -1056,16 +955,13 @@ impl Filesystem for CasFuseFs {
             reply.error(Errno::ENOENT);
             return;
         }
-        let mut daemon = match self.connect_daemon() {
-            Ok(v) => v,
-            Err(err) => {
-                reply.error(err_to_errno(&err));
-                return;
-            }
-        };
+        let mut client = reply_error!(
+            reply,
+            self.connect_daemon().map_err(|err| err_to_errno(&err))
+        );
         let root = PathBuf::from_str("/").unwrap();
         let data = match self.open_files.get_mut(&fh_in.0) {
-            Some(mut of) => match of.copy_from(offset_in, len, &root, &mut daemon) {
+            Some(mut of) => match of.copy_from(offset_in, len, &root, &mut client) {
                 Ok(v) => v,
                 Err(err) => {
                     reply.error(err_to_errno(&err));
@@ -1078,7 +974,7 @@ impl Filesystem for CasFuseFs {
             }
         };
         let written = match self.open_files.get_mut(&fh_out.0) {
-            Some(mut of) => match of.write_at(offset_out, &data, &root, &mut daemon) {
+            Some(mut of) => match of.write_at(offset_out, &data, &root, &mut client) {
                 Ok(v) => v,
                 Err(err) => {
                     reply.error(err_to_errno(&err));
@@ -1194,16 +1090,13 @@ impl Filesystem for CasFuseFs {
             }
         };
         let pos = match self.open_files.get_mut(&fh.0) {
-            Some(mut of) => {
-                let file = Self::file_from_openfile(&mut of);
-                match io::Seek::seek(file, wh) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        reply.error(Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO)));
-                        return;
-                    }
+            Some(mut of) => match io::Seek::seek(of.as_mut(), wh) {
+                Ok(v) => v,
+                Err(e) => {
+                    reply.error(Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO)));
+                    return;
                 }
-            }
+            },
             None => {
                 reply.error(Errno::EBADF);
                 return;
@@ -1253,14 +1146,11 @@ impl Filesystem for CasFuseFs {
             }
         }
 
-        let mut daemon = match self.connect_daemon() {
-            Ok(v) => v,
-            Err(err) => {
-                reply.error(err_to_errno(&err));
-                return;
-            }
-        };
-        if let Ok(fuse_entries) = daemon.read_dir_all(path.clone()) {
+        let mut client = reply_error!(
+            reply,
+            self.connect_daemon().map_err(|err| err_to_errno(&err))
+        );
+        if let Ok(fuse_entries) = client.read_dir_all(path.clone()) {
             let mut whiteouts = HashSet::new();
             for (child_path, entry) in fuse_entries {
                 let Some(name) = child_path.file_name() else {
