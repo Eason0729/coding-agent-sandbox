@@ -161,37 +161,24 @@ impl CasFuseFs {
         }
     }
 
-    fn open_options_from_flags(flags: i32) -> std::fs::OpenOptions {
+    fn open_options_from_flags(flags: OpenFlags) -> std::fs::OpenOptions {
+        // Kernel handles O_CREAT, O_EXCL, O_NOCTTY, O_TRUNC (fuser docs)
         let mut opts = fs::OpenOptions::new();
-        let accmode = flags & libc::O_ACCMODE;
-        match accmode {
-            libc::O_RDONLY => {
+        match flags.acc_mode() {
+            OpenAccMode::O_RDONLY => {
                 opts.read(true);
             }
-            libc::O_WRONLY => {
+            OpenAccMode::O_WRONLY => {
                 opts.write(true);
             }
-            libc::O_RDWR => {
+            OpenAccMode::O_RDWR => {
                 opts.read(true).write(true);
             }
-            _ => {
-                opts.read(true);
-            }
         }
-        opts.custom_flags(flags);
-        if flags & libc::O_TRUNC != 0 {
-            opts.truncate(true);
+        if (flags.0 & libc::O_APPEND) != 0 {
+            opts.append(true);
         }
         opts
-    }
-
-    fn has_write_intent(flags: i32) -> bool {
-        let accmode = flags & libc::O_ACCMODE;
-        accmode == libc::O_WRONLY
-            || accmode == libc::O_RDWR
-            || (flags & libc::O_TRUNC) != 0
-            || (flags & libc::O_APPEND) != 0
-            || (flags & libc::O_CREAT) != 0
     }
 
     fn recursive_real_descendants(path: &Path) -> Vec<PathBuf> {
@@ -302,6 +289,10 @@ impl Filesystem for CasFuseFs {
             Ok((_kind, attr)) => reply.attr(&TTL, &attr),
             Err(err) => reply.error(err_to_errno(&err)),
         }
+    }
+
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        reply.size(0);
     }
 
     fn setattr(
@@ -663,7 +654,6 @@ impl Filesystem for CasFuseFs {
             self.connect_daemon().map_err(|err| err_to_errno(&err))
         );
         let access = self.policy.classify(&path);
-        let raw_flags = flags.0;
 
         let need_write = matches!(
             flags.acc_mode(),
@@ -727,7 +717,7 @@ impl Filesystem for CasFuseFs {
 
         let file = reply_error!(
             reply,
-            Self::open_options_from_flags(raw_flags)
+            Self::open_options_from_flags(flags)
                 .open(&target_path)
                 .map_err(|e| Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO)))
         );
@@ -773,7 +763,7 @@ impl Filesystem for CasFuseFs {
 
         let state = match self.policy.classify(&path) {
             AccessMode::Passthrough => {
-                let mut opts = Self::open_options_from_flags(raw_flags);
+                let mut opts = Self::open_options_from_flags(OpenFlags(raw_flags));
                 opts.create(true).mode(mode);
                 match opts.open(&path) {
                     Ok(file) => OpenFile::PassthroughReal { file },
@@ -794,7 +784,7 @@ impl Filesystem for CasFuseFs {
                     }
                 };
                 let _ = client.delete_whiteout(path.clone());
-                let mut opts = Self::open_options_from_flags(raw_flags);
+                let mut opts = Self::open_options_from_flags(OpenFlags(raw_flags));
                 opts.create(true).mode(mode);
                 match opts.open(&object_path) {
                     Ok(file) => OpenFile::PassthroughObject {
