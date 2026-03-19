@@ -13,23 +13,17 @@ use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixS
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::runtime::Runtime;
-use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 
-use crate::syncing::disk::{self, AccessLog, FuseMap, SandboxMeta};
+use crate::syncing::disk::{self, FuseMap, SandboxMeta};
 use crate::syncing::object::ObjectStore;
 use crate::syncing::proto::{EntryType, FuseEntry, Request, Response};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Mutable daemon state shared across request handlers.
-///
-/// Object storage and access logging stay behind separate async mutexes so
-/// request dispatch can keep path metadata concurrent via `DashMap`.
 pub struct ServerState {
-    pub objects: Mutex<ObjectStore>,
+    pub objects: Arc<ObjectStore>,
     pub fuse_map: DashMap<PathBuf, crate::syncing::proto::FuseEntry>,
-    pub access_log: Mutex<AccessLog>,
     pub sandbox_dir: PathBuf,
     pub shm_name: String,
     pub abi_version: u32,
@@ -104,7 +98,7 @@ fn snapshot_state(state: &ServerState) -> (SandboxMeta, FuseMap) {
     let meta = SandboxMeta {
         shm_name: state.shm_name.clone(),
         abi_version: state.abi_version,
-        next_id: state.objects.blocking_lock().next_id(),
+        next_id: state.objects.next_id(),
     };
     let fuse_map = FuseMap {
         entries: state
@@ -122,13 +116,9 @@ fn build_server_state(sandbox_dir: &Path) -> std::result::Result<Arc<ServerState
     let objects_dir = sandbox_dir.join(".sandbox").join("data").join("objects");
     let object_store = ObjectStore::new(objects_dir, meta.next_id);
 
-    let log_path = sandbox_dir.join(".sandbox").join("data").join("access.log");
-    let access_log = AccessLog::open(&log_path).map_err(|e| e.to_string())?;
-
     Ok(Arc::new(ServerState {
-        objects: Mutex::new(object_store),
+        objects: Arc::new(object_store),
         fuse_map: DashMap::from_iter(fuse_map.entries),
-        access_log: Mutex::new(access_log),
         sandbox_dir: sandbox_dir.to_path_buf(),
         shm_name: meta.shm_name,
         abi_version: meta.abi_version,
@@ -286,7 +276,6 @@ async fn handle_connection(
 async fn dispatch(state: &ServerState, request: Request) -> Response {
     match request {
         Request::EnsureFileObject { path, meta } => {
-            let mut objects = state.objects.lock().await;
             let existing = state.fuse_map.get(&path).map(|v| v.clone());
             match existing {
                 Some(entry)
@@ -295,7 +284,7 @@ async fn dispatch(state: &ServerState, request: Request) -> Response {
                         && entry.symlink_target.is_none() =>
                 {
                     let id = entry.object_id.unwrap_or_default();
-                    let object_path = objects.path_for(id);
+                    let object_path = state.objects.path_for(id);
                     let new_entry = FuseEntry {
                         entry_type: EntryType::File,
                         metadata: meta,
@@ -308,9 +297,9 @@ async fn dispatch(state: &ServerState, request: Request) -> Response {
                         path: object_path,
                     }
                 }
-                _ => match objects.alloc_empty() {
+                _ => match state.objects.alloc_empty() {
                     Ok(id) => {
-                        let object_path = objects.path_for(id);
+                        let object_path = state.objects.path_for(id);
                         let entry = FuseEntry {
                             entry_type: EntryType::File,
                             metadata: meta,
@@ -328,10 +317,9 @@ async fn dispatch(state: &ServerState, request: Request) -> Response {
             }
         }
         Request::GetObjectPath { id } => {
-            let objects = state.objects.lock().await;
-            if objects.exists(id) {
+            if state.objects.exists(id) {
                 Response::GetObjectPath {
-                    path: objects.path_for(id),
+                    path: state.objects.path_for(id),
                 }
             } else {
                 Response::NotFound
@@ -486,22 +474,12 @@ async fn dispatch(state: &ServerState, request: Request) -> Response {
             }
             Response::RenameTree
         }
-        Request::LogAccess {
-            path,
-            operation,
-            pid,
-        } => {
-            let mut access_log = state.access_log.lock().await;
-            match access_log.log(&path, &operation, pid) {
-                Ok(()) => Response::LogAccess,
-                Err(e) => Response::error(e.to_string()),
-            }
-        }
+        Request::LogAccess { .. } => Response::error("LogAccess is not implemented"),
         Request::Flush => {
             let meta = SandboxMeta {
                 shm_name: state.shm_name.clone(),
                 abi_version: state.abi_version,
-                next_id: state.objects.lock().await.next_id(),
+                next_id: state.objects.next_id(),
             };
             let fuse_map = FuseMap {
                 entries: state

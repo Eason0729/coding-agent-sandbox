@@ -1,6 +1,7 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
 
@@ -14,12 +15,15 @@ pub enum ObjectError {
 
 pub struct ObjectStore {
     dir: PathBuf,
-    next_id: u64,
+    next_id: AtomicU64,
 }
 
 impl ObjectStore {
     pub fn new(dir: PathBuf, next_id: u64) -> Self {
-        Self { dir, next_id }
+        Self {
+            dir,
+            next_id: AtomicU64::new(next_id),
+        }
     }
 
     pub fn dir(&self) -> &PathBuf {
@@ -27,16 +31,15 @@ impl ObjectStore {
     }
 
     pub fn next_id(&self) -> u64 {
-        self.next_id
+        self.next_id.load(Ordering::Acquire)
     }
 
-    pub fn set_next_id(&mut self, id: u64) {
-        self.next_id = id;
+    pub fn set_next_id(&self, id: u64) {
+        self.next_id.store(id, Ordering::Release);
     }
 
-    pub fn put(&mut self, data: &[u8]) -> Result<u64, ObjectError> {
-        let id = self.next_id;
-        self.next_id += 1;
+    pub fn put(&self, data: &[u8]) -> Result<u64, ObjectError> {
+        let id = self.next_id.fetch_add(1, Ordering::AcqRel);
 
         let path = self.object_path(id);
         let mut file = File::create(&path)?;
@@ -46,7 +49,7 @@ impl ObjectStore {
         Ok(id)
     }
 
-    pub fn alloc_empty(&mut self) -> Result<u64, ObjectError> {
+    pub fn alloc_empty(&self) -> Result<u64, ObjectError> {
         self.put(&[])
     }
 

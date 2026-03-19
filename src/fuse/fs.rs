@@ -162,14 +162,18 @@ impl CasFuseFs {
     }
 
     fn open_options_from_flags(flags: OpenFlags) -> std::fs::OpenOptions {
-        // Kernel handles O_CREAT, O_EXCL, O_NOCTTY, O_TRUNC (fuser docs)
+        // Kernel handles O_CREAT, O_EXCL, O_NOCTTY (libfuse docs)
+        // O_TRUNC is NOT filtered - it remains in flags
+        // O_APPEND: filesystem must handle if writeback caching is disabled
         let mut opts = fs::OpenOptions::new();
         match flags.acc_mode() {
             OpenAccMode::O_RDONLY => {
                 opts.read(true);
             }
             OpenAccMode::O_WRONLY => {
-                opts.write(true);
+                // With writeback caching, kernel may send READ requests even for O_WRONLY
+                // (when partially writing uncached pages), so we need read access
+                opts.read(true).write(true);
             }
             OpenAccMode::O_RDWR => {
                 opts.read(true).write(true);
@@ -215,7 +219,7 @@ fn check_export_component(component: &OsStr) -> bool {
 
 macro_rules! get_path {
     ($self:ident, $rep: ident, $parent: expr) => {
-        match $self.path_of($p) {
+        match $self.path_of($parent) {
             Some(mut path) => path,
             None => {
                 $rep.error(Errno::ENOENT);
@@ -245,12 +249,11 @@ impl Filesystem for CasFuseFs {
     fn init(&mut self, req: &Request, config: &mut KernelConfig) -> io::Result<()> {
         const FLAGS: &[InitFlags] = &[
             InitFlags::FUSE_ASYNC_READ,
-            InitFlags::FUSE_WRITEBACK_CACHE,
-            InitFlags::FUSE_WRITEBACK_CACHE,
             InitFlags::FUSE_BIG_WRITES,
             InitFlags::FUSE_PARALLEL_DIROPS,
             InitFlags::FUSE_EXPORT_SUPPORT,
             InitFlags::FUSE_PASSTHROUGH,
+            InitFlags::FUSE_WRITEBACK_CACHE,
         ];
         for flag in FLAGS {
             config.add_capabilities(*flag).ok();
