@@ -2,12 +2,6 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BytePatch {
-    pub offset: u64,
-    pub data: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMetadata {
     pub size: u64,
     pub mode: u32,
@@ -16,23 +10,6 @@ pub struct FileMetadata {
     pub mtime: u64,
     pub atime: u64,
     pub ctime: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DirMetadata {
-    pub mode: u32,
-    pub uid: u32,
-    pub gid: u32,
-    pub mtime: u64,
-    pub atime: u64,
-    pub ctime: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FuseEntry {
-    pub id: u64,
-    pub entry_type: EntryType,
-    pub metadata: FileMetadata,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -44,33 +21,25 @@ pub enum EntryType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DirEntry {
-    pub path: PathBuf,
-    pub entry: FuseEntry,
+pub struct FuseEntry {
+    pub entry_type: EntryType,
+    pub metadata: FileMetadata,
+    pub object_id: Option<u64>,
+    pub symlink_target: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
-    PutObject {
-        data: Vec<u8>,
-    },
-    GetObject {
-        id: u64,
-    },
-    GetObjectRange {
-        id: u64,
-        offset: u64,
-        len: u32,
-    },
-    PutFile {
+    EnsureFileObject {
         path: PathBuf,
-        data: Vec<u8>,
         meta: FileMetadata,
     },
-    PatchFile {
+    GetObjectPath {
+        id: u64,
+    },
+    UpsertFileEntry {
         path: PathBuf,
-        patches: Vec<BytePatch>,
-        truncate_to: Option<u64>,
+        object_id: u64,
         meta: FileMetadata,
     },
     PutFileMeta {
@@ -92,13 +61,28 @@ pub enum Request {
     },
     PutDir {
         path: PathBuf,
-        meta: DirMetadata,
+        meta: FileMetadata,
+    },
+    PutSymlink {
+        path: PathBuf,
+        target: Vec<u8>,
+        meta: FileMetadata,
     },
     PutWhiteout {
         path: PathBuf,
     },
+    DeleteWhiteout {
+        path: PathBuf,
+    },
     ReadDirAll {
         path: PathBuf,
+    },
+    ListWhiteoutUnder {
+        path: PathBuf,
+    },
+    RenameTree {
+        from: PathBuf,
+        to: PathBuf,
     },
     LogAccess {
         path: PathBuf,
@@ -110,19 +94,21 @@ pub enum Request {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
-    PutObject { id: u64 },
-    GetObject { data: Vec<u8> },
-    GetObjectRange { data: Vec<u8> },
-    PutFile { id: u64 },
-    PatchFile { id: u64 },
+    EnsureFileObject { id: u64, path: PathBuf },
+    GetObjectPath { path: PathBuf },
+    UpsertFileEntry,
     PutFileMeta,
     GetFileMeta(Option<FileMetadata>),
     GetEntry(Option<FuseEntry>),
     DeleteFile,
     RenameFile,
     PutDir,
+    PutSymlink,
     PutWhiteout,
+    DeleteWhiteout,
     DirEntries(Vec<(PathBuf, FuseEntry)>),
+    WhiteoutPaths(Vec<PathBuf>),
+    RenameTree,
     LogAccess,
     Flush,
     Ok,

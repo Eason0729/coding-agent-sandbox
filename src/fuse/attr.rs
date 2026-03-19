@@ -34,6 +34,15 @@ pub fn attr_from_meta(ino: u64, meta: &std::fs::Metadata) -> FileAttr {
     let atime = system_time_from_unix_i64(meta.atime());
     let mtime = system_time_from_unix_i64(meta.mtime());
     let ctime = system_time_from_unix_i64(meta.ctime());
+
+    fn map_nobody(uid: u32) -> u32 {
+        if uid == 65534 {
+            0
+        } else {
+            uid
+        }
+    }
+
     FileAttr {
         ino: INodeNo(ino),
         size: meta.size(),
@@ -45,17 +54,15 @@ pub fn attr_from_meta(ino: u64, meta: &std::fs::Metadata) -> FileAttr {
         kind,
         perm: (meta.mode() & 0o7777) as u16,
         nlink: meta.nlink() as u32,
-        uid: meta.uid(),
-        gid: meta.gid(),
+        uid: map_nobody(meta.uid()),
+        gid: map_nobody(meta.gid()),
         rdev: meta.rdev() as u32,
         blksize: meta.blksize() as u32,
         flags: 0,
     }
 }
 
-#[allow(dead_code)]
 pub fn attr_from_nix_stat(ino: u64, meta: &libc::stat) -> FileAttr {
-    use std::os::unix::fs::MetadataExt;
     let kind = if meta.st_mode & libc::S_IFDIR as u32 != 0 {
         FileType::Directory
     } else if meta.st_mode & libc::S_IFLNK as u32 != 0 {

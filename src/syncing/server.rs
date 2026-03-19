@@ -1,125 +1,31 @@
 use std::collections::HashMap;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::thread;
-use std::time::Duration;
 
 use dashmap::DashMap;
 use log;
 use nix::errno::Errno;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{fork, ForkResult};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::io::{Read, Write};
+use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::runtime::Runtime;
+use tokio::sync::Mutex;
+use tokio::time::{sleep, Duration};
 
 use crate::syncing::disk::{self, AccessLog, FuseMap, SandboxMeta};
 use crate::syncing::object::ObjectStore;
-use crate::syncing::proto::{Request, Response};
+use crate::syncing::proto::{EntryType, FuseEntry, Request, Response};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 
-pub fn default_worker_count() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(8)
-        .max(1)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::io::{Read, Write};
-    use std::os::unix::net::{UnixListener, UnixStream};
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::Arc;
-    use std::thread;
-    use std::time::Duration;
-
-    use tempfile::tempdir;
-
-    use super::default_worker_count;
-    use crate::syncing::proto::Request;
-
-    #[test]
-    fn default_worker_count_is_bounded() {
-        let n = default_worker_count();
-        assert!((1..=4).contains(&n));
-    }
-
-    #[test]
-    fn thread_per_connection_allows_concurrent_clients() {
-        let td = tempdir().expect("tempdir");
-        let sock = td.path().join("daemon.sock");
-        let listener = UnixListener::bind(&sock).expect("bind listener");
-        listener.set_nonblocking(true).expect("set nonblocking");
-
-        let active_requests = Arc::new(AtomicUsize::new(0));
-        let running = Arc::new(AtomicBool::new(true));
-
-        let active_clone = Arc::clone(&active_requests);
-        let running_clone = Arc::clone(&running);
-
-        let _handle = thread::spawn(move || {
-            while running_clone.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((_stream, _)) => {
-                        // Just accept connections
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        let idle_count = 4;
-        let mut idle_conns = Vec::new();
-        for _ in 0..idle_count {
-            let conn = UnixStream::connect(&sock).expect("connect idle");
-            idle_conns.push(conn);
-        }
-
-        let active_clone2 = Arc::clone(&active_clone);
-        let _active_conn = thread::spawn(move || {
-            let mut conn = UnixStream::connect(&sock).expect("connect active");
-            active_clone2.fetch_add(1, Ordering::SeqCst);
-
-            let req = postcard::to_allocvec(&Request::GetEntry {
-                path: PathBuf::from("/test"),
-            })
-            .unwrap();
-            let len = (req.len() as u32).to_le_bytes();
-            conn.write_all(&len).unwrap();
-            conn.write_all(&req).unwrap();
-            conn.flush().unwrap();
-
-            let mut len_buf = [0u8; 4];
-            conn.read_exact(&mut len_buf).unwrap();
-        });
-
-        thread::sleep(Duration::from_millis(100));
-
-        assert!(
-            active_requests.load(Ordering::SeqCst) > 0,
-            "active request should have been served despite idle connections"
-        );
-
-        running.store(false, Ordering::Relaxed);
-        drop(idle_conns);
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-/// Mutable server state shared across worker threads.
+/// Mutable daemon state shared across request handlers.
 ///
-/// This state intentionally separates high-contention data:
-/// - object store mutations behind one mutex,
-/// - path map in `DashMap` for concurrent row access,
-/// - append-only access log behind one mutex.
+/// Object storage and access logging stay behind separate async mutexes so
+/// request dispatch can keep path metadata concurrent via `DashMap`.
 pub struct ServerState {
     pub objects: Mutex<ObjectStore>,
     pub fuse_map: DashMap<PathBuf, crate::syncing::proto::FuseEntry>,
@@ -129,24 +35,19 @@ pub struct ServerState {
     pub abi_version: u32,
 }
 
-/// Shutdown polling contract owned by `run.rs`.
-///
-/// The syncing daemon does not know SHM details. It only asks whether shutdown
-/// should happen; if yes, the caller executes server-finalization callback while
-/// preserving its own lock/transition invariants.
+/// Shutdown poll contract owned by the caller.
 pub trait PollLock {
     fn poll_shutdown<F>(&mut self, on_shutdown: F) -> bool
     where
         F: FnOnce();
 }
 
-/// Fork and run syncing server; return when socket is ready.
 pub fn fork_and_run<P, F>(sandbox_dir: PathBuf, mut poll_lock: P, on_ready: F) -> nix::Result<()>
 where
     P: PollLock,
     F: FnOnce(),
 {
-    let (mut parent_sock, mut child_sock) = UnixStream::pair().map_err(|_| Errno::EIO)?;
+    let (mut parent_sock, mut child_sock) = StdUnixStream::pair().map_err(|_| Errno::EIO)?;
     parent_sock.set_nonblocking(true).map_err(|_| Errno::EIO)?;
 
     match unsafe { fork() }? {
@@ -158,7 +59,7 @@ where
             log::debug!("sync.start event=parent_wait_ready");
 
             loop {
-                match parent_sock.read(&mut ready) {
+                match <StdUnixStream as Read>::read(&mut parent_sock, &mut ready) {
                     Ok(1) => {
                         log::debug!("sync.start event=ready_signal_received");
                         on_ready();
@@ -180,7 +81,7 @@ where
                 if std::time::Instant::now() > deadline {
                     return Err(Errno::ETIMEDOUT);
                 }
-                thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
         ForkResult::Child => {
@@ -188,8 +89,8 @@ where
             run(
                 sandbox_dir,
                 move || {
-                    let _ = child_sock.write_all(&[1]);
-                    let _ = child_sock.flush();
+                    let _ = <StdUnixStream as Write>::write_all(&mut child_sock, &[1]);
+                    let _ = <StdUnixStream as Write>::flush(&mut child_sock);
                 },
                 &mut poll_lock,
             );
@@ -199,12 +100,11 @@ where
     Ok(())
 }
 
-/// Build a flush snapshot from concurrent in-memory structures.
 fn snapshot_state(state: &ServerState) -> (SandboxMeta, FuseMap) {
     let meta = SandboxMeta {
         shm_name: state.shm_name.clone(),
         abi_version: state.abi_version,
-        next_id: state.objects.lock().unwrap().next_id(),
+        next_id: state.objects.blocking_lock().next_id(),
     };
     let fuse_map = FuseMap {
         entries: state
@@ -216,7 +116,6 @@ fn snapshot_state(state: &ServerState) -> (SandboxMeta, FuseMap) {
     (meta, fuse_map)
 }
 
-/// Load persisted state and build in-memory daemon structures.
 fn build_server_state(sandbox_dir: &Path) -> std::result::Result<Arc<ServerState>, String> {
     let (meta, fuse_map) = disk::load(&sandbox_dir.to_path_buf()).map_err(|e| e.to_string())?;
 
@@ -236,8 +135,22 @@ fn build_server_state(sandbox_dir: &Path) -> std::result::Result<Arc<ServerState
     }))
 }
 
-/// Bind daemon socket and apply socket file permissions.
-fn bind_listener(sock_path: &Path) -> std::io::Result<UnixListener> {
+fn bind_listener(sock_path: &Path) -> std::io::Result<StdUnixListener> {
+    if let Some(parent) = sock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _ = std::fs::remove_file(sock_path);
+
+    let listener = StdUnixListener::bind(sock_path)?;
+    std::fs::set_permissions(
+        sock_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+}
+
+fn bind_listener_async(sock_path: &Path) -> std::io::Result<UnixListener> {
     if let Some(parent) = sock_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -248,11 +161,9 @@ fn bind_listener(sock_path: &Path) -> std::io::Result<UnixListener> {
         sock_path,
         std::os::unix::fs::PermissionsExt::from_mode(0o600),
     )?;
-    listener.set_nonblocking(true)?;
     Ok(listener)
 }
 
-/// Finalize daemon state and remove socket path.
 fn flush_and_remove_socket(state: &ServerState, sock_path: &Path) {
     let (meta, fuse_map) = snapshot_state(state);
     if let Err(e) = disk::flush(&state.sandbox_dir, &meta, &fuse_map) {
@@ -261,47 +172,15 @@ fn flush_and_remove_socket(state: &ServerState, sock_path: &Path) {
     let _ = std::fs::remove_file(sock_path);
 }
 
-/// Accept loop with thread-per-connection model.
-/// Each incoming connection gets its own dedicated thread, ensuring idle persistent
-/// connections never block other connections from making progress.
-fn run_accept_loop<P: PollLock>(
-    listener: &UnixListener,
-    state: &Arc<ServerState>,
-    sock_path: &Path,
-    poll_lock: &mut P,
-    shutdown_flag: &Arc<AtomicBool>,
-) -> bool {
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                let state_ref = Arc::clone(state);
-                let shutdown_flag_ref = Arc::clone(shutdown_flag);
-                thread::spawn(move || {
-                    if let Err(e) = handle_connection(&state_ref, stream) {
-                        log::error!("sync.conn event=serve_failed error={e}");
-                    }
-                    if shutdown_flag_ref.load(Ordering::Acquire) {
-                        log::debug!("sync.conn event=connection_shutdown");
-                    }
-                });
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(e) => {
-                log::error!("sync.accept event=error error={e}");
-                return false;
-            }
-        }
+pub fn run<P: PollLock>(sandbox_dir: PathBuf, ready: impl FnOnce(), poll_lock: &mut P) {
+    let rt = Runtime::new().expect("failed to build tokio runtime");
 
-        if poll_lock.poll_shutdown(|| flush_and_remove_socket(state.as_ref(), sock_path)) {
-            return true;
-        }
-    }
+    rt.block_on(async {
+        run_async(sandbox_dir, ready, poll_lock).await;
+    });
 }
 
-/// Main daemon loop for the syncing process.
-pub fn run<P: PollLock>(sandbox_dir: PathBuf, ready: impl FnOnce(), poll_lock: &mut P) {
+async fn run_async<P: PollLock>(sandbox_dir: PathBuf, ready: impl FnOnce(), poll_lock: &mut P) {
     let state = match build_server_state(&sandbox_dir) {
         Ok(v) => v,
         Err(e) => {
@@ -311,7 +190,7 @@ pub fn run<P: PollLock>(sandbox_dir: PathBuf, ready: impl FnOnce(), poll_lock: &
     };
 
     let sock_path = sandbox_dir.join(".sandbox").join("daemon.sock");
-    let listener = match bind_listener(&sock_path) {
+    let listener = match bind_listener_async(&sock_path) {
         Ok(l) => l,
         Err(e) => {
             log::error!(
@@ -327,150 +206,151 @@ pub fn run<P: PollLock>(sandbox_dir: PathBuf, ready: impl FnOnce(), poll_lock: &
 
     let shutdown_flag = Arc::new(AtomicBool::new(false));
 
-    let shutdown_committed =
-        run_accept_loop(&listener, &state, &sock_path, poll_lock, &shutdown_flag);
+    let accept_flag = Arc::clone(&shutdown_flag);
+    let state_ref = Arc::clone(&state);
+    let _sock_path_ref = sock_path.clone();
+
+    tokio::spawn(async move {
+        while !accept_flag.load(Ordering::Acquire) {
+            sleep(Duration::from_millis(100)).await;
+        }
+    });
+
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, _)) => {
+                        let state_ref = Arc::clone(&state_ref);
+                        let shutdown_flag_ref = Arc::clone(&shutdown_flag);
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_connection(&state_ref, stream).await {
+                                log::error!("sync.conn event=serve_failed error={e}");
+                            }
+                            if shutdown_flag_ref.load(Ordering::Acquire) {
+                                log::debug!("sync.conn event=connection_shutdown");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        log::error!("sync.accept event=error error={e}");
+                    }
+                }
+            }
+        }
+
+        if poll_lock.poll_shutdown(|| flush_and_remove_socket(state.as_ref(), &sock_path)) {
+            shutdown_flag.store(true, Ordering::Release);
+            break;
+        }
+    }
 
     shutdown_flag.store(true, Ordering::Release);
+    sleep(Duration::from_millis(100)).await;
 
-    thread::sleep(Duration::from_millis(100));
-
-    if !shutdown_committed {
-        flush_and_remove_socket(state.as_ref(), &sock_path);
-    }
+    flush_and_remove_socket(state.as_ref(), &sock_path);
 
     std::process::exit(0);
 }
 
-/// Serve framed request/response traffic for one connected client.
-///
-/// Protocol framing: little-endian u32 length prefix followed by postcard payload.
-/// The loop exits cleanly on EOF and propagates parse/IO errors to the caller,
-/// which logs and drops the connection.
-fn handle_connection(
+async fn handle_connection(
     state: &ServerState,
     mut stream: UnixStream,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
         let mut length_buf = [0u8; 4];
-        match stream.read_exact(&mut length_buf) {
-            Ok(()) => {}
-            // Client closed the connection cleanly.
+        match AsyncReadExt::read_exact(&mut stream, &mut length_buf).await {
+            Ok(4) => {}
+            Ok(_) => return Err("read_exact returned unexpected byte count".into()),
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e.into()),
         }
         let length = u32::from_le_bytes(length_buf) as usize;
 
         let mut request_buf = vec![0u8; length];
-        stream.read_exact(&mut request_buf)?;
+        AsyncReadExt::read_exact(&mut stream, &mut request_buf).await?;
 
         let request: Request = postcard::from_bytes(&request_buf)?;
-        let response = dispatch(state, request);
+        let response = dispatch(state, request).await;
 
         let response_data = postcard::to_allocvec(&response)?;
         let response_len = (response_data.len() as u32).to_le_bytes();
-        stream.write_all(&response_len)?;
-        stream.write_all(&response_data)?;
-        stream.flush()?;
+        AsyncWriteExt::write_all(&mut stream, &response_len).await?;
+        AsyncWriteExt::write_all(&mut stream, &response_data).await?;
+        AsyncWriteExt::flush(&mut stream).await?;
     }
 
     Ok(())
 }
 
-/// Dispatch one typed request into state mutations and typed response.
-///
-/// The dispatcher never panics on malformed protocol-level operations; recoverable
-/// failures are mapped to `Response::Error` so clients get explicit failures.
-fn dispatch(state: &ServerState, request: Request) -> Response {
+async fn dispatch(state: &ServerState, request: Request) -> Response {
     match request {
-        // Object API
-        Request::PutObject { data } => {
-            let mut objects = state.objects.lock().unwrap();
-            match objects.put(&data) {
-                Ok(id) => Response::PutObject { id },
-                Err(e) => Response::error(e.to_string()),
-            }
-        }
-        Request::GetObject { id } => {
-            let objects = state.objects.lock().unwrap();
-            match objects.get(id) {
-                Ok(data) => Response::GetObject { data },
-                Err(e) => Response::error(e.to_string()),
-            }
-        }
-        Request::GetObjectRange { id, offset, len } => {
-            let objects = state.objects.lock().unwrap();
-            match objects.get_range(id, offset, len as usize) {
-                Ok(data) => Response::GetObjectRange { data },
-                Err(e) => Response::error(e.to_string()),
-            }
-        }
-
-        // File/object metadata API
-        Request::PutFile { path, data, meta } => {
-            let mut objects = state.objects.lock().unwrap();
-
-            match objects.put(&data) {
-                Ok(id) => {
-                    let entry = crate::syncing::proto::FuseEntry {
-                        id,
-                        entry_type: crate::syncing::proto::EntryType::File,
+        Request::EnsureFileObject { path, meta } => {
+            let mut objects = state.objects.lock().await;
+            let existing = state.fuse_map.get(&path).map(|v| v.clone());
+            match existing {
+                Some(entry)
+                    if entry.entry_type == EntryType::File
+                        && entry.object_id.is_some()
+                        && entry.symlink_target.is_none() =>
+                {
+                    let id = entry.object_id.unwrap_or_default();
+                    let object_path = objects.path_for(id);
+                    let new_entry = FuseEntry {
+                        entry_type: EntryType::File,
                         metadata: meta,
+                        object_id: Some(id),
+                        symlink_target: None,
                     };
-                    state.fuse_map.insert(path, entry);
-                    Response::PutFile { id }
+                    state.fuse_map.insert(path, new_entry);
+                    Response::EnsureFileObject {
+                        id,
+                        path: object_path,
+                    }
                 }
-                Err(e) => Response::error(e.to_string()),
+                _ => match objects.alloc_empty() {
+                    Ok(id) => {
+                        let object_path = objects.path_for(id);
+                        let entry = FuseEntry {
+                            entry_type: EntryType::File,
+                            metadata: meta,
+                            object_id: Some(id),
+                            symlink_target: None,
+                        };
+                        state.fuse_map.insert(path, entry);
+                        Response::EnsureFileObject {
+                            id,
+                            path: object_path,
+                        }
+                    }
+                    Err(e) => Response::error(e.to_string()),
+                },
             }
         }
-        Request::PatchFile {
+        Request::GetObjectPath { id } => {
+            let objects = state.objects.lock().await;
+            if objects.exists(id) {
+                Response::GetObjectPath {
+                    path: objects.path_for(id),
+                }
+            } else {
+                Response::NotFound
+            }
+        }
+        Request::UpsertFileEntry {
             path,
-            patches,
-            truncate_to,
+            object_id,
             meta,
         } => {
-            let mut objects = state.objects.lock().unwrap();
-            let Some(existing) = state.fuse_map.get(&path).map(|v| v.clone()) else {
-                return Response::error("File not found");
+            let entry = FuseEntry {
+                entry_type: EntryType::File,
+                metadata: meta,
+                object_id: Some(object_id),
+                symlink_target: None,
             };
-
-            let mut bytes = match objects.get(existing.id) {
-                Ok(v) => v,
-                Err(_) => Vec::new(),
-            };
-
-            for patch in patches {
-                let start = patch.offset as usize;
-                let end = start.saturating_add(patch.data.len());
-                if end > bytes.len() {
-                    bytes.resize(end, 0);
-                }
-                bytes[start..end].copy_from_slice(&patch.data);
-            }
-
-            if let Some(sz) = truncate_to {
-                let sz = sz as usize;
-                if sz < bytes.len() {
-                    bytes.truncate(sz);
-                } else if sz > bytes.len() {
-                    bytes.resize(sz, 0);
-                }
-            }
-
-            match objects.put(&bytes) {
-                Ok(id) => {
-                    let entry = crate::syncing::proto::FuseEntry {
-                        id,
-                        entry_type: existing.entry_type,
-                        metadata: meta,
-                    };
-                    state.fuse_map.insert(path, entry);
-                    Response::PatchFile { id }
-                }
-                Err(e) => Response::error(e.to_string()),
-            }
+            state.fuse_map.insert(path, entry);
+            Response::UpsertFileEntry
         }
-
-        // Namespace mutation API
         Request::PutFileMeta { path, meta } => match state.fuse_map.get_mut(&path) {
             Some(mut entry) => {
                 entry.metadata = meta;
@@ -498,36 +378,29 @@ fn dispatch(state: &ServerState, request: Request) -> Response {
                 Response::error("Source path not found")
             }
         }
-
-        // Directory/whiteout API
         Request::PutDir { path, meta } => {
-            let mut objects = state.objects.lock().unwrap();
-
-            match objects.put(&[]) {
-                Ok(id) => {
-                    let entry = crate::syncing::proto::FuseEntry {
-                        id,
-                        entry_type: crate::syncing::proto::EntryType::Dir,
-                        metadata: crate::syncing::proto::FileMetadata {
-                            size: 0,
-                            mode: meta.mode,
-                            uid: meta.uid,
-                            gid: meta.gid,
-                            mtime: meta.mtime,
-                            atime: meta.atime,
-                            ctime: meta.ctime,
-                        },
-                    };
-                    state.fuse_map.insert(path, entry);
-                    Response::PutDir
-                }
-                Err(e) => Response::error(e.to_string()),
-            }
+            let entry = FuseEntry {
+                entry_type: EntryType::Dir,
+                metadata: meta,
+                object_id: None,
+                symlink_target: None,
+            };
+            state.fuse_map.insert(path, entry);
+            Response::PutDir
+        }
+        Request::PutSymlink { path, target, meta } => {
+            let entry = FuseEntry {
+                entry_type: EntryType::Symlink,
+                metadata: meta,
+                object_id: None,
+                symlink_target: Some(target),
+            };
+            state.fuse_map.insert(path, entry);
+            Response::PutSymlink
         }
         Request::PutWhiteout { path } => {
-            let entry = crate::syncing::proto::FuseEntry {
-                id: 0,
-                entry_type: crate::syncing::proto::EntryType::Whiteout,
+            let entry = FuseEntry {
+                entry_type: EntryType::Whiteout,
                 metadata: crate::syncing::proto::FileMetadata {
                     size: 0,
                     mode: 0,
@@ -537,19 +410,27 @@ fn dispatch(state: &ServerState, request: Request) -> Response {
                     atime: 0,
                     ctime: 0,
                 },
+                object_id: None,
+                symlink_target: None,
             };
             state.fuse_map.insert(path, entry);
             Response::PutWhiteout
         }
-
-        // Enumeration/logging/flush API
+        Request::DeleteWhiteout { path } => {
+            if let Some(existing) = state.fuse_map.get(&path) {
+                if existing.entry_type == EntryType::Whiteout {
+                    drop(existing);
+                    state.fuse_map.remove(&path);
+                }
+            }
+            Response::DeleteWhiteout
+        }
         Request::ReadDirAll { path } => {
             let entries: Vec<_> = state
                 .fuse_map
                 .iter()
                 .filter(|kv| {
                     let p = kv.key();
-                    // Match entries whose parent equals the requested path.
                     p.parent() == Some(path.as_path())
                         || (path == PathBuf::from("/")
                             && p.parent().is_none()
@@ -560,12 +441,57 @@ fn dispatch(state: &ServerState, request: Request) -> Response {
 
             Response::DirEntries(entries)
         }
+        Request::ListWhiteoutUnder { path } => {
+            let prefix = if path == Path::new("/") {
+                PathBuf::from("/")
+            } else {
+                path.clone()
+            };
+            let whiteouts = state
+                .fuse_map
+                .iter()
+                .filter_map(|kv| {
+                    let p = kv.key();
+                    let is_descendant = p.starts_with(&prefix) && p != &prefix;
+                    if is_descendant && kv.value().entry_type == EntryType::Whiteout {
+                        Some(p.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            Response::WhiteoutPaths(whiteouts)
+        }
+        Request::RenameTree { from, to } => {
+            let entries = state
+                .fuse_map
+                .iter()
+                .filter_map(|kv| {
+                    if kv.key() == &from || kv.key().starts_with(&from) {
+                        Some((kv.key().clone(), kv.value().clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            for (old_path, entry) in entries {
+                state.fuse_map.remove(&old_path);
+                let rel = old_path.strip_prefix(&from).unwrap_or(Path::new(""));
+                let mut new_path = to.clone();
+                if !rel.as_os_str().is_empty() {
+                    new_path.push(rel);
+                }
+                state.fuse_map.insert(new_path, entry);
+            }
+            Response::RenameTree
+        }
         Request::LogAccess {
             path,
             operation,
             pid,
         } => {
-            let mut access_log = state.access_log.lock().unwrap();
+            let mut access_log = state.access_log.lock().await;
             match access_log.log(&path, &operation, pid) {
                 Ok(()) => Response::LogAccess,
                 Err(e) => Response::error(e.to_string()),
@@ -575,7 +501,7 @@ fn dispatch(state: &ServerState, request: Request) -> Response {
             let meta = SandboxMeta {
                 shm_name: state.shm_name.clone(),
                 abi_version: state.abi_version,
-                next_id: state.objects.lock().unwrap().next_id(),
+                next_id: state.objects.lock().await.next_id(),
             };
             let fuse_map = FuseMap {
                 entries: state

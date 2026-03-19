@@ -46,8 +46,8 @@ impl UserNs {
         let uid_map = format!("{} {} 1\n", uid, uid);
         let gid_map = format!("{} {} 1\n", gid, gid);
 
-        Self::write_id_map("/proc/self/uid_map", &uid_map).map_err(Stage1Error::WriteUidMap)?;
         Self::write_id_map("/proc/self/setgroups", "deny\n").map_err(Stage1Error::WriteGidMap)?;
+        Self::write_id_map("/proc/self/uid_map", &uid_map).map_err(Stage1Error::WriteUidMap)?;
         Self::write_id_map("/proc/self/gid_map", &gid_map).map_err(Stage1Error::WriteGidMap)?;
 
         Ok(Self { uid, gid })

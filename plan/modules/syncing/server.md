@@ -1,55 +1,54 @@
-Implement the syncing daemon server — `syncing/server/objects.rs`, `syncing/server/disk.rs`, and `syncing/server/mod.rs`.
+Implement syncing daemon server as metadata authority with object-id allocation.
 
-## Startup Sequence
+## Responsibilities
 
-1. Receive the SHM guard (adopted by `shm::adopt_mutex_after_fork` after fork).
-2. Call `disk::load(sandbox_dir)` → `(meta, fuse_map)`.
-3. Construct `ObjectStore { dir: sandbox_dir/data/objects, next_id: meta.next_id }`.
-4. Open `access.log` for appending.
-5. Bind `UnixListener` on `{sandbox_dir}/daemon.sock` (mode 0o600).
-6. Set `shm_state.socket_ready = 1` (sequentially consistent store).
-7. Drop the SHM guard (unlock mutex so waiting `cas run` processes proceed).
-8. Enter the accept loop.
+- Own in-memory path map: `HashMap<PathBuf, FuseEntry>` (stored as concurrent map in impl).
+- Own object-id allocator and object file creation.
+- Persist metadata map and allocator state to disk.
+- Never receive or return file content bytes.
 
-## Accept Loop
+## Startup
 
-Thread-per-connection model:
+1. Load metadata snapshot (`disk::load`).
+2. Build `ObjectStore` with loaded `next_id`.
+3. Open access log.
+4. Bind unix socket.
+5. Serve requests.
 
-1. Main thread accepts `UnixStream` connections.
-2. For each incoming connection, spawn a dedicated thread to run `handle_connection` until EOF.
-3. Each connection is fully independent — idle persistent connections (from client connection pools) never block other connections.
+## Protocol handling rules
 
-**Why not bounded worker pool:** The previous bounded worker pool model could cause worker starvation when multiple sandbox instances ran concurrently. Each persistent client connection (from `SyncClientPool`) holds a worker thread indefinitely while waiting for future requests. With only 4 workers, one sandbox's pool could occupy all workers, leaving another sandbox's connection requests unscheduled.
+- `EnsureFileObject`:
+  - if file entry with object exists: return existing object.
+  - else allocate id, create empty object file, insert file entry.
+- `GetObjectPath`:
+  - return object real path if object exists.
+- `PutDir` / `PutSymlink` / `PutWhiteout`:
+  - overwrite exact path entry type.
+- `DeleteWhiteout`:
+  - only remove entry when exact path is whiteout.
+- `RenameTree`:
+  - move exact root and all descendants.
+- `ReadDirAll`:
+  - return direct children only.
 
-Thread-per-connection ensures every incoming connection makes progress regardless of other connections' state.
+## Locking
 
-## Concurrency and Locking
+- metadata map: per-entry concurrency.
+- object store mutex: allocator + object existence/path operations.
+- do not hold metadata row guards while waiting object lock.
 
-- Metadata map uses a per-row concurrent hashmap (dashmap).
-- Access log remains a single mutex-guarded file append.
-- Object storage keeps a mutex for object-id allocation and file mutation, while metadata lookups/updates are per-row.
-- Lock ordering rule: never hold metadata row guards while waiting on the object-store mutex.
+## Whiteout behavior
 
-## Protocol Update (v2)
-
-Server supports partial object/file IO primitives:
-
-- `GetObjectRange { id, offset, len }`
-- `PatchFile { path, patches, truncate_to }`
-
-These are the canonical write path for FUSE dirty ranged files.
+- Whiteout is exact-path tombstone.
+- No implicit opaque subtree mode.
+- FUSE layer owns merged readdir semantics.
 
 ## Shutdown
 
-Shutdown is triggered when `shm_state.running_count` reaches 0, polled in the main accept loop (not per-connection thread).
+- Flush map + metadata to disk.
+- Remove socket.
 
-**Shutdown steps:**
-1. Break the accept loop (main thread).
-2. Send shutdown signal to all active connection threads (optional: let them finish current request).
-3. Call `disk::flush(sandbox_dir, &meta, &fuse_map)` (equivalent to handling a `Flush` request).
-4. Remove `daemon.sock`.
-5. Exit the process.
+## Error handling
 
-## Error Handling
-
-All `Result` errors in request dispatch are converted to `Response::Error(msg)`. The server never panics on a bad client request.
+- Invalid/missing state -> `Response::Error(msg)` or `NotFound` where specified.
+- Never panic on client input.

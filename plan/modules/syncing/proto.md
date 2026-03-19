@@ -1,45 +1,71 @@
-Implement `syncing/proto.rs` — shared data types for serialization and the request/response protocol between FUSE daemons and the syncing daemon.
+Implement `syncing/proto.rs` as a metadata-only protocol between FUSE daemons and the syncing daemon.
 
-## List of all message/response
+## Design goal
 
-| Intent | Request sent | Expected response |
-|---|---|---|
-| `put_object(&mut self, data: &[u8]) -> Result<u64>` | `PutObject` | `PutObject { id }` |
-| `get_object(&mut self, id: u64) -> Result<Vec<u8>>` | `GetObject` | `GetObject { data }` |
-| `put_file(&mut self, path: PathBuf, data: Vec<u8>, meta: FileMetadata) -> Result<u64>` | `PutFile` | `PutFile { id }` |
-| `put_file_meta(&mut self, path: PathBuf, meta: FileMetadata) -> Result<()>` | `PutFileMeta` | `Ok` |
-| `get_file_meta(&mut self, path: PathBuf) -> Result<Option<FileMetadata>>` | `GetFileMeta` | `FileMeta` or `NotFound → None` |
-| `get_entry(&mut self, path: PathBuf) -> Result<Option<FuseEntry>>` | `GetEntry` | `Entry` or `NotFound` |
-| `delete_file(&mut self, path: PathBuf) -> Result<()>` | `DeleteFile` | `Ok` |
-| `rename_file(&mut self, from: PathBuf, to: PathBuf) -> Result<()>` | `RenameFile` | `Ok` |
-| `put_dir(&mut self, path: PathBuf, meta: DirMetadata) -> Result<()>` | `PutDir` | `Ok` |
-| `put_whiteout(&mut self, path: PathBuf) -> Result<()>` | `PutWhiteout` | `Ok` |
-| `read_dir_all(&mut self, path: PathBuf) -> Result<Vec<(PathBuf, FuseEntry)>>` | `ReadDirAll` | `DirEntries` |
-| `log_access(&mut self, path: PathBuf, operation: String, pid: u32) -> Result<()>` | `LogAccess` | `Ok` |
-| `flush(&mut self) -> Result<()>` | `Flush` | `Ok` |
+Protocol never transfers file content bytes. It only manages:
 
-## Protocol v2 (breaking)
+- path -> metadata map
+- path -> object id mapping for regular files
+- object id -> object path lookup for FUSE to open backing files directly on real FS
 
-`PutObject`/`GetObject` remain for full blob operations, but v2 canonical data path is ranged:
+Object file content is written/read by FUSE via normal filesystem syscalls.
 
-| Intent | Request sent | Expected response |
-|---|---|---|
-| `get_object_range(&mut self, id: u64, offset: u64, len: u32) -> Result<Vec<u8>>` | `GetObjectRange` | `GetObjectRange { data }` |
-| `patch_file(&mut self, path: PathBuf, patches: Vec<BytePatch>, truncate_to: Option<u64>, meta: FileMetadata) -> Result<u64>` | `PatchFile` | `PatchFile { id }` |
-
-### BytePatch
-
-`BytePatch` is an absolute in-file update:
+## Core data types
 
 ```rust
-struct BytePatch {
-    offset: u64,
-    data: Vec<u8>,
+struct FileMetadata {
+    size: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    mtime: u64,
+    atime: u64,
+    ctime: u64,
+}
+
+enum EntryType {
+    File,
+    Dir,
+    Symlink,
+    Whiteout,
+}
+
+struct FuseEntry {
+    entry_type: EntryType,
+    metadata: FileMetadata,
+    object_id: Option<u64>,
+    symlink_target: Option<Vec<u8>>,
 }
 ```
 
-Patches are applied in request order. Overlapping ranges are allowed; later patches overwrite earlier bytes.
+## Request/response list
 
-## Derive Bounds
+| Intent | Request | Response |
+|---|---|---|
+| ensure regular file has backing object | `EnsureFileObject { path, meta }` | `EnsureFileObject { id, path }` |
+| map object id to real object path | `GetObjectPath { id }` | `GetObjectPath { path }` or `NotFound` |
+| explicit file entry upsert | `UpsertFileEntry { path, object_id, meta }` | `UpsertFileEntry` |
+| update metadata only | `PutFileMeta { path, meta }` | `PutFileMeta` |
+| fetch metadata only | `GetFileMeta { path }` | `GetFileMeta(Option<FileMetadata>)` |
+| lookup exact path entry | `GetEntry { path }` | `GetEntry(Option<FuseEntry>)` |
+| remove exact path entry | `DeleteFile { path }` | `DeleteFile` |
+| rename exact path | `RenameFile { from, to }` | `RenameFile` |
+| upsert directory entry | `PutDir { path, meta }` | `PutDir` |
+| upsert symlink entry | `PutSymlink { path, target, meta }` | `PutSymlink` |
+| place exact-path tombstone | `PutWhiteout { path }` | `PutWhiteout` |
+| remove exact-path tombstone | `DeleteWhiteout { path }` | `DeleteWhiteout` |
+| list direct children entries | `ReadDirAll { path }` | `DirEntries(Vec<(PathBuf, FuseEntry)>)` |
+| list descendant whiteouts | `ListWhiteoutUnder { path }` | `WhiteoutPaths(Vec<PathBuf>)` |
+| rename subtree entries | `RenameTree { from, to }` | `RenameTree` |
+| append access log | `LogAccess { path, operation, pid }` | `LogAccess` |
+| persist daemon state | `Flush` | `Flush` |
 
-All types derive `serde::Serialize + serde::Deserialize` and `Debug`.
+## Merge/whiteout semantics
+
+- Whiteout is exact-path hide marker.
+- A managed directory does not implicitly hide its subtree.
+- Readdir merge is done in FUSE layer; server only returns direct children entries.
+
+## Derive bounds
+
+All protocol types derive `serde::Serialize + serde::Deserialize + Debug`.

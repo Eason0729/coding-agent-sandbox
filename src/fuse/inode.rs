@@ -9,7 +9,9 @@ use dashmap::DashMap;
 /// from scratch on each mount and never persisted.  The root of the mounted
 /// tree is always inode 1.
 pub struct InodeTable {
+    /// Absolute paths indexed by inode number.
     ino_to_path: DashMap<u64, PathBuf>,
+    /// Inode numbers indexed by absolute path.
     path_to_ino: DashMap<PathBuf, u64>,
     next_ino: AtomicU64,
 }
@@ -29,9 +31,6 @@ impl InodeTable {
     }
 
     /// Return the existing inode for `path`, or assign a new one and return it.
-    ///
-    /// `path` must be an absolute path; a `debug_assert` enforces this in
-    /// debug builds.
     pub fn get_or_insert(&self, path: &Path) -> u64 {
         debug_assert!(path.is_absolute(), "path must be absolute: {:?}", path);
         if let Some(ino) = self.path_to_ino.get(path) {

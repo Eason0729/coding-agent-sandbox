@@ -348,22 +348,7 @@ fn run_setup_stage1(payload: SetupPayload) -> ! {
 
 /// FUSE child: connect daemon client and serve mount loop.
 fn run_fuse_daemon(mountpoint: PathBuf, daemon_socket: PathBuf, policy: Arc<dyn Policy>) -> ! {
-    let daemon = match SyncClient::connect(&daemon_socket) {
-        Ok(d) => d,
-        Err(e) => {
-            log::error!("fuse.child event=daemon_connect_failed error={e}");
-            std::process::exit(1);
-        }
-    };
-
-    let pool_cap = crate::syncing::server::default_worker_count();
-    let fuse_fs = crate::fuse::CasFuseFs::new(
-        PathBuf::from("/"),
-        daemon_socket.clone(),
-        daemon,
-        policy,
-        pool_cap,
-    );
+    let fuse_fs = crate::fuse::CasFuseFs::new(daemon_socket.clone(), policy);
 
     if let Err(e) = crate::fuse::run_fuse(fuse_fs, &mountpoint) {
         log::error!(

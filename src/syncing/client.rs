@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-use crate::syncing::proto::{BytePatch, DirMetadata, FileMetadata, FuseEntry, Request, Response};
+use crate::syncing::proto::{FileMetadata, FuseEntry, Request, Response};
 
 #[derive(Error, Debug)]
 pub enum ClientError {
@@ -47,69 +47,42 @@ impl SyncClient {
         Ok(response)
     }
 
-    pub fn put_object(&mut self, data: &[u8]) -> Result<u64, ClientError> {
-        let response = self.send_request(Request::PutObject {
-            data: data.to_vec(),
-        })?;
-        match response {
-            Response::PutObject { id } => Ok(id),
-            Response::Error(msg) => Err(ClientError::Server(msg)),
-            _ => Err(ClientError::Server("Unexpected response".to_string())),
-        }
-    }
-
-    pub fn get_object(&mut self, id: u64) -> Result<Vec<u8>, ClientError> {
-        let response = self.send_request(Request::GetObject { id })?;
-        match response {
-            Response::GetObject { data } => Ok(data),
-            Response::Error(msg) => Err(ClientError::Server(msg)),
-            _ => Err(ClientError::Server("Unexpected response".to_string())),
-        }
-    }
-
-    pub fn get_object_range(
-        &mut self,
-        id: u64,
-        offset: u64,
-        len: u32,
-    ) -> Result<Vec<u8>, ClientError> {
-        let response = self.send_request(Request::GetObjectRange { id, offset, len })?;
-        match response {
-            Response::GetObjectRange { data } => Ok(data),
-            Response::Error(msg) => Err(ClientError::Server(msg)),
-            _ => Err(ClientError::Server("Unexpected response".to_string())),
-        }
-    }
-
-    pub fn put_file(
+    pub fn ensure_file_object(
         &mut self,
         path: PathBuf,
-        data: Vec<u8>,
         meta: FileMetadata,
-    ) -> Result<u64, ClientError> {
-        let response = self.send_request(Request::PutFile { path, data, meta })?;
+    ) -> Result<(u64, PathBuf), ClientError> {
+        let response = self.send_request(Request::EnsureFileObject { path, meta })?;
         match response {
-            Response::PutFile { id } => Ok(id),
+            Response::EnsureFileObject { id, path } => Ok((id, path)),
             Response::Error(msg) => Err(ClientError::Server(msg)),
             _ => Err(ClientError::Server("Unexpected response".to_string())),
         }
     }
 
-    pub fn patch_file(
+    pub fn get_object_path(&mut self, id: u64) -> Result<PathBuf, ClientError> {
+        let response = self.send_request(Request::GetObjectPath { id })?;
+        match response {
+            Response::GetObjectPath { path } => Ok(path),
+            Response::NotFound => Err(ClientError::NotFound),
+            Response::Error(msg) => Err(ClientError::Server(msg)),
+            _ => Err(ClientError::Server("Unexpected response".to_string())),
+        }
+    }
+
+    pub fn upsert_file_entry(
         &mut self,
         path: PathBuf,
-        patches: Vec<BytePatch>,
-        truncate_to: Option<u64>,
+        object_id: u64,
         meta: FileMetadata,
-    ) -> Result<u64, ClientError> {
-        let response = self.send_request(Request::PatchFile {
+    ) -> Result<(), ClientError> {
+        let response = self.send_request(Request::UpsertFileEntry {
             path,
-            patches,
-            truncate_to,
+            object_id,
             meta,
         })?;
         match response {
-            Response::PatchFile { id } => Ok(id),
+            Response::UpsertFileEntry => Ok(()),
             Response::Error(msg) => Err(ClientError::Server(msg)),
             _ => Err(ClientError::Server("Unexpected response".to_string())),
         }
@@ -160,10 +133,24 @@ impl SyncClient {
         }
     }
 
-    pub fn put_dir(&mut self, path: PathBuf, meta: DirMetadata) -> Result<(), ClientError> {
+    pub fn put_dir(&mut self, path: PathBuf, meta: FileMetadata) -> Result<(), ClientError> {
         let response = self.send_request(Request::PutDir { path, meta })?;
         match response {
             Response::PutDir => Ok(()),
+            Response::Error(msg) => Err(ClientError::Server(msg)),
+            _ => Err(ClientError::Server("Unexpected response".to_string())),
+        }
+    }
+
+    pub fn put_symlink(
+        &mut self,
+        path: PathBuf,
+        target: Vec<u8>,
+        meta: FileMetadata,
+    ) -> Result<(), ClientError> {
+        let response = self.send_request(Request::PutSymlink { path, target, meta })?;
+        match response {
+            Response::PutSymlink => Ok(()),
             Response::Error(msg) => Err(ClientError::Server(msg)),
             _ => Err(ClientError::Server("Unexpected response".to_string())),
         }
@@ -178,6 +165,15 @@ impl SyncClient {
         }
     }
 
+    pub fn delete_whiteout(&mut self, path: PathBuf) -> Result<(), ClientError> {
+        let response = self.send_request(Request::DeleteWhiteout { path })?;
+        match response {
+            Response::DeleteWhiteout => Ok(()),
+            Response::Error(msg) => Err(ClientError::Server(msg)),
+            _ => Err(ClientError::Server("Unexpected response".to_string())),
+        }
+    }
+
     pub fn read_dir_all(
         &mut self,
         path: PathBuf,
@@ -185,6 +181,24 @@ impl SyncClient {
         let response = self.send_request(Request::ReadDirAll { path })?;
         match response {
             Response::DirEntries(entries) => Ok(entries),
+            Response::Error(msg) => Err(ClientError::Server(msg)),
+            _ => Err(ClientError::Server("Unexpected response".to_string())),
+        }
+    }
+
+    pub fn list_whiteout_under(&mut self, path: PathBuf) -> Result<Vec<PathBuf>, ClientError> {
+        let response = self.send_request(Request::ListWhiteoutUnder { path })?;
+        match response {
+            Response::WhiteoutPaths(paths) => Ok(paths),
+            Response::Error(msg) => Err(ClientError::Server(msg)),
+            _ => Err(ClientError::Server("Unexpected response".to_string())),
+        }
+    }
+
+    pub fn rename_tree(&mut self, from: PathBuf, to: PathBuf) -> Result<(), ClientError> {
+        let response = self.send_request(Request::RenameTree { from, to })?;
+        match response {
+            Response::RenameTree => Ok(()),
             Response::Error(msg) => Err(ClientError::Server(msg)),
             _ => Err(ClientError::Server("Unexpected response".to_string())),
         }
@@ -216,6 +230,4 @@ impl SyncClient {
             _ => Err(ClientError::Server("Unexpected response".to_string())),
         }
     }
-
-    // FIXME: we need partial update for speed
 }

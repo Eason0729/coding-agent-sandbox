@@ -1,3 +1,5 @@
+What's the project: It's a real linux container. It's rootless!
+
 # Plan Folder
 
 There are multiple human-reviewed markdown files including:

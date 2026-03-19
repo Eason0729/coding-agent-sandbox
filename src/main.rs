@@ -1,5 +1,6 @@
 mod cli;
 mod config;
+mod error;
 mod fuse;
 #[path = "log.rs"]
 mod inner_log;

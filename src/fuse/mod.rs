@@ -1,5 +1,6 @@
 pub mod attr;
 pub mod fs;
+pub mod inner;
 pub mod inode;
 pub mod mount;
 pub mod open_file;

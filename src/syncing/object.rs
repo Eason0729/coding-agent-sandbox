@@ -46,6 +46,14 @@ impl ObjectStore {
         Ok(id)
     }
 
+    pub fn alloc_empty(&mut self) -> Result<u64, ObjectError> {
+        self.put(&[])
+    }
+
+    pub fn path_for(&self, id: u64) -> PathBuf {
+        self.object_path(id)
+    }
+
     pub fn get(&self, id: u64) -> Result<Vec<u8>, ObjectError> {
         let path = self.object_path(id);
         if !path.exists() {
