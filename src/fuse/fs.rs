@@ -935,7 +935,6 @@ impl Filesystem for CasFuseFs {
             return;
         }
         let root = PathBuf::from_str("/").unwrap();
-        log::debug!("write debug offset={}, size={}", offset, data.len());
         let res = match self.open_files.get_mut(&fh.0) {
             Some(mut of) => of.write_at(offset, data, &root, &mut daemon),
             None => {

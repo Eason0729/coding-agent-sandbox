@@ -2,3 +2,4 @@ whitelist = []
 blacklist = []
 disableLog = []
 logLevel = "info"
+log = "./.sandbox/cas.log"

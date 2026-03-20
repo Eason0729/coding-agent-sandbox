@@ -4,14 +4,14 @@ Implement `log.rs` — Logging initialization and configuration.
 
 ## Functions
 
-### `init_logger(level: LevelFilter)`
+### `init_logger(level: LevelFilter, log_path: Option<&str>)`
 
-Initialize the `env_logger` with the given log level filter.
+Initialize the `env_logger` with the given log level filter and destination.
 
-- **Target**: stderr (or pipe to file if `debug` feature is enabled)
+- **Target**: stderr if `log_path` is `None`; file at `log_path` if `Some(path)`.
 - **fuser module**: Always logged at `Info` level (to reduce noise from FUSE library)
 - **Other modules**: Logged at the specified `level`
-- **Debug feature**: When compiled with `--features debug`, logs are also written to `/tmp/test.txt`
+- **Debug feature** (`--features debug`): ignored for log destination — destination is fully controlled by `log_path` config.
 
 ### `log_level_from_config(root: &PathBuf) -> LevelFilter`
 

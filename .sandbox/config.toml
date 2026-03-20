@@ -1,4 +1,5 @@
 whitelist = []
 blacklist = []
 disableLog = []
-logLevel = "info"
+logLevel = "debug"
+log = "./.sandbox/cas.log"

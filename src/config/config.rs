@@ -52,6 +52,9 @@ pub struct Config {
 
     #[serde(default, alias = "logLevel", alias = "LogLevel", alias = "log_level")]
     pub log_level: Option<String>,
+
+    #[serde(default, alias = "log", alias = "Log", alias = "log_path")]
+    pub log: Option<String>,
 }
 
 /// Error returned by [`Config::from_str`] and [`Config::from_file`].

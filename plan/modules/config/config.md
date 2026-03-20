@@ -18,9 +18,15 @@ disableLog = []
 
 # Logging level: error, warn, info, debug, trace (default: info)
 logLevel = "info"
+
+# Log output destination (default: ./.sandbox/cas.log)
+# If omitted, logs go to stderr.
+# If set to a path, logs are written to that file.
+log = "./.sandbox/cas.log"
 ```
 
 - All fields are optional. If omitted, the list is empty (logLevel defaults to "info").
+- `log` field: `Option<String>`. Omitted means stderr; set to a path string means log to that file.
 
 ## Note
 - implicitly add pwd to whitelist(If pwd does not match blacklist)

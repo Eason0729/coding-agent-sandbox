@@ -52,7 +52,8 @@ fn main() {
     let cli = Cli::parse();
 
     let root = cli.root.canonicalize().unwrap_or(cli.root.clone());
-    inner_log::init_logger(inner_log::log_level_from_config(&root));
+    let (log_level, log_path) = inner_log::log_data_from_config(&root);
+    inner_log::init_logger(log_level, log_path);
 
     match cli.command {
         Commands::Init => {
