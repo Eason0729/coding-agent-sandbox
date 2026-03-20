@@ -30,6 +30,7 @@ pub fn apply_seccomp_filter() -> Result<()> {
 fn allow_core_syscalls(ctx: &mut ScmpFilterContext) -> Result<()> {
     let syscalls = [
         "read",
+        "readv",
         "write",
         "writev",
         "pwritev",
