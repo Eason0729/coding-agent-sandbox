@@ -49,7 +49,6 @@ pub fn prepare_chroot(
     rootfs: &Path,
     mountpoint: &Path,
     cwd: &Path,
-    controlling_tty: &Option<PathBuf>,
     pty_slave: &Option<PathBuf>,
 ) -> Result<()> {
     // Pre-create the mountpoint directories and device file placeholders on the
@@ -69,7 +68,7 @@ pub fn prepare_chroot(
 
     // 2. Stack real /proc and /dev nodes on top of FUSE.
     bind_mount_proc(rootfs)?;
-    bind_mount_dev(rootfs, controlling_tty, pty_slave)?;
+    bind_mount_dev(rootfs, pty_slave)?;
 
     // 3. chroot into the prepared rootfs.
     chroot(rootfs).map_err(|e| Stage2Error::Chroot {
@@ -132,11 +131,7 @@ fn bind_mount_proc(rootfs: &Path) -> Result<()> {
     })
 }
 
-fn bind_mount_dev(
-    rootfs: &Path,
-    controlling_tty: &Option<PathBuf>,
-    pty_slave: &Option<PathBuf>,
-) -> Result<()> {
+fn bind_mount_dev(rootfs: &Path, pty_slave: &Option<PathBuf>) -> Result<()> {
     let dev_devices = ["null", "zero", "urandom", "random"];
     let dev_target = rootfs.join("dev");
 
@@ -154,22 +149,6 @@ fn bind_mount_dev(
         .map_err(|e| Stage2Error::Mount {
             src: source,
             tgt: target.display().to_string(),
-            err: e,
-        })?;
-    }
-
-    if let Some(tty_path) = controlling_tty {
-        let target_tty_path = dev_target.join("tty");
-        mount(
-            Some(tty_path.as_os_str()),
-            &target_tty_path,
-            None::<&str>,
-            MsFlags::MS_BIND,
-            None::<&str>,
-        )
-        .map_err(|e| Stage2Error::Mount {
-            src: tty_path.to_string_lossy().into_owned(),
-            tgt: target_tty_path.display().to_string(),
             err: e,
         })?;
     }

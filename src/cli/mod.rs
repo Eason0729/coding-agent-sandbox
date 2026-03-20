@@ -2,6 +2,7 @@ pub mod clean;
 pub mod init;
 pub mod purge;
 pub mod run;
+pub mod sandbox;
 
 pub use clean::cmd_clean;
 pub use init::cmd_init;
