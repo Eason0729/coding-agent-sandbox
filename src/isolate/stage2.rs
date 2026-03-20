@@ -50,6 +50,7 @@ pub fn prepare_chroot(
     mountpoint: &Path,
     cwd: &Path,
     controlling_tty: &Option<PathBuf>,
+    pty_slave: &Option<PathBuf>,
 ) -> Result<()> {
     // Pre-create the mountpoint directories and device file placeholders on the
     // real tempdir BEFORE binding FUSE at the rootfs root.  The FUSE bind-mount
@@ -68,7 +69,7 @@ pub fn prepare_chroot(
 
     // 2. Stack real /proc and /dev nodes on top of FUSE.
     bind_mount_proc(rootfs)?;
-    bind_mount_dev(rootfs, controlling_tty)?;
+    bind_mount_dev(rootfs, controlling_tty, pty_slave)?;
 
     // 3. chroot into the prepared rootfs.
     chroot(rootfs).map_err(|e| Stage2Error::Chroot {
@@ -131,7 +132,11 @@ fn bind_mount_proc(rootfs: &Path) -> Result<()> {
     })
 }
 
-fn bind_mount_dev(rootfs: &Path, controlling_tty: &Option<PathBuf>) -> Result<()> {
+fn bind_mount_dev(
+    rootfs: &Path,
+    controlling_tty: &Option<PathBuf>,
+    pty_slave: &Option<PathBuf>,
+) -> Result<()> {
     let dev_devices = ["null", "zero", "urandom", "random"];
     let dev_target = rootfs.join("dev");
 
@@ -154,18 +159,63 @@ fn bind_mount_dev(rootfs: &Path, controlling_tty: &Option<PathBuf>) -> Result<()
     }
 
     if let Some(tty_path) = controlling_tty {
-        let target = dev_target.join("tty");
-        let tty_path_str: String = tty_path.to_string_lossy().into_owned();
+        let target_tty_path = dev_target.join("tty");
         mount(
-            Some(tty_path_str.as_str()),
-            &target,
+            Some(tty_path.as_os_str()),
+            &target_tty_path,
             None::<&str>,
             MsFlags::MS_BIND,
             None::<&str>,
         )
         .map_err(|e| Stage2Error::Mount {
             src: tty_path.to_string_lossy().into_owned(),
-            tgt: target.display().to_string(),
+            tgt: target_tty_path.display().to_string(),
+            err: e,
+        })?;
+    }
+
+    let target_pts_path = dev_target.join("pts");
+    std::fs::create_dir_all(&target_pts_path).map_err(|e| Stage2Error::MountIo(e.to_string()))?;
+    mount(
+        Some("devpts"),
+        &target_pts_path,
+        Some("devpts"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
+        Some("newinstance,mode=666,ptmxmode=666"),
+    )
+    .map_err(|e| Stage2Error::Mount {
+        src: "devpts".to_string(),
+        tgt: target_pts_path.display().to_string(),
+        err: e,
+    })?;
+
+    let target_ptmx_path = dev_target.join("ptmx");
+    let source_ptmx_path = target_pts_path.join("ptmx");
+    mount(
+        Some(source_ptmx_path.as_os_str()),
+        &target_ptmx_path,
+        None::<&str>,
+        MsFlags::MS_BIND,
+        None::<&str>,
+    )
+    .map_err(|e| Stage2Error::Mount {
+        src: source_ptmx_path.display().to_string(),
+        tgt: target_ptmx_path.display().to_string(),
+        err: e,
+    })?;
+
+    if let Some(pty_slave_path) = pty_slave {
+        let target_tty_path = dev_target.join("tty");
+        mount(
+            Some(pty_slave_path.as_os_str()),
+            &target_tty_path,
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .map_err(|e| Stage2Error::Mount {
+            src: pty_slave_path.display().to_string(),
+            tgt: target_tty_path.display().to_string(),
             err: e,
         })?;
     }

@@ -253,6 +253,24 @@ else
 	fail "interactive bash PTY test failed: $PTY_OUT"
 fi
 
+# Sub-test C: openpty inside sandbox should work for TUI apps (e.g. opencode)
+set +e
+OPENPTY_OUT=$(
+	run_in "$PROJECT" python3 - <<'PYEOF'
+import pty
+pty.openpty()
+print("OPENPTY_OK")
+PYEOF
+)
+OPENPTY_CODE=$?
+set -e
+
+if [ "$OPENPTY_CODE" = "0" ] && echo "$OPENPTY_OUT" | grep -q "OPENPTY_OK"; then
+	pass "pty.openpty works inside sandbox"
+else
+	fail "pty.openpty failed in sandbox (code=$OPENPTY_CODE out=$OPENPTY_OUT)"
+fi
+
 # ── Test 11: cas clean ────────────────────────────────────────────────────────
 echo ""
 echo "=== Test 11: cas clean ==="
