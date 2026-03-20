@@ -662,6 +662,7 @@ impl Filesystem for CasFuseFs {
             flags.acc_mode(),
             OpenAccMode::O_RDWR | OpenAccMode::O_WRONLY
         );
+        let truncate_requested = (flags.0 & libc::O_TRUNC) != 0;
 
         let entry = reply_error!(
             reply,
@@ -708,10 +709,28 @@ impl Filesystem for CasFuseFs {
             }
             AccessMode::CopyOnWrite => {
                 if !need_write {
-                    (path.clone(), None)
+                    match (object_id, object_path) {
+                        (Some(oid), Some(p)) => (p, Some(oid)),
+                        (Some(_), None) => {
+                            reply.error(Errno::EIO);
+                            return;
+                        }
+                        (None, _) => (path.clone(), None),
+                    }
                 } else {
+                    let had_object = object_id.is_some();
                     let oid = ensure!(object_id, 0);
                     let p = ensure!(object_path, 1);
+                    if !had_object && !truncate_requested {
+                        if path.exists() {
+                            reply_error!(
+                                reply,
+                                fs::copy(&path, &p).map_err(|e| {
+                                    Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO))
+                                })
+                            );
+                        }
+                    }
                     let _ = client.delete_whiteout(path.clone());
                     (p, Some(oid))
                 }

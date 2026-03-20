@@ -120,6 +120,22 @@ else
 	pass "real file not created (CoW only)"
 fi
 
+# ── Test 1e: CoW new file read-after-create with O_RDONLY ───────────────────────
+echo ""
+echo "=== Test 1e: CoW read-after-create with O_RDONLY ==="
+
+COW_NEW_READ="$TMP/cow_new_read.txt"
+rm -f "$COW_NEW_READ"
+
+OUT=$(run_in "$PROJECT" bash -c "touch '$COW_NEW_READ' && cat '$COW_NEW_READ'" 2>/dev/null || true)
+check_eq "CoW read-after-create (touch then cat) succeeds" "" "$OUT"
+
+if [ -f "$COW_NEW_READ" ]; then
+	fail "real file should not exist after CoW read-after-create"
+else
+	pass "real file still absent after CoW read-after-create"
+fi
+
 # ── Test 2: Passthrough read — project file visible in sandbox ────────────────
 echo ""
 echo "=== Test 2: Passthrough read — project file content visible inside sandbox ==="
@@ -152,6 +168,29 @@ else
 
 	REAL_VAL=$(sqlite3 "$DB" "SELECT v FROM t;")
 	check_eq "sqlite3 real DB unchanged after CoW write" "before" "$REAL_VAL"
+
+	# Regression: opening existing CoW DB with O_RDWR must not see zero header.
+	SQL_HDR=$(
+		run_in "$PROJECT" python3 - <<PYEOF
+import os
+fd = os.open(r"$DB", os.O_RDWR)
+try:
+    print(os.read(fd, 16))
+finally:
+    os.close(fd)
+PYEOF
+	)
+	check_eq "sqlite CoW O_RDWR sees real header on first open" "b'SQLite format 3\\x00'" "$SQL_HDR"
+
+	set +e
+	SQL_TABLES=$(run_in "$PROJECT" sqlite3 "$DB" ".tables" 2>/dev/null)
+	SQL_CODE=$?
+	set -e
+	if [ "$SQL_CODE" = "0" ] && echo "$SQL_TABLES" | grep -q "^t$"; then
+		pass "sqlite3 can open CoW DB and list tables"
+	else
+		fail "sqlite3 should open CoW DB (code=$SQL_CODE out=$SQL_TABLES)"
+	fi
 fi
 
 # ── Test 5: Passthrough write (whitelist path) ─────────────────────────────────
