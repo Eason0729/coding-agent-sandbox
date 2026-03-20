@@ -9,7 +9,7 @@ Stage 2 runs in the **child process** (the one that will become the final sandbo
    - Bind-mount the FUSE mountpoint at the **root** of the chroot (`rootfs/`) — FUSE presents the entire host filesystem, so no system directories need to be separately mounted
    - Bind-mount `/proc` from the host into `rootfs/proc`
    - Bind-mount individual `/dev` device files into `rootfs/dev/`
-   - Bind-mount the controlling PTY as `rootfs/dev/tty` (if the sandbox has a controlling terminal)
+   - Bind-mount the allocated PTY slave as `rootfs/dev/tty` (if the sandbox runs with PTY enabled)
    - Mount a `tmpfs` at `rootfs/tmp`
 3. `chroot` into the tempdir rootfs
 4. `chdir` to the original working directory (which is accessible through FUSE passthrough)
@@ -37,7 +37,7 @@ rootfs/dev/null  ← bind-mount of /dev/null  (MS_BIND; target file created firs
 rootfs/dev/zero  ← bind-mount of /dev/zero
 rootfs/dev/urandom
 rootfs/dev/random
-rootfs/dev/tty   ← bind-mount of controlling PTY from host (if available)
+rootfs/dev/tty   ← bind-mount of allocated PTY slave from host (if PTY enabled)
 rootfs/tmp/      ← tmpfs
 ```
 
@@ -50,4 +50,4 @@ Because FUSE is bind-mounted at `rootfs/`, all of `/bin`, `/usr`, `/lib`, the pr
 3. Device files must be bind-mounted one-by-one; the target files must be created (`std::fs::File::create`) before the bind mount since the kernel requires file-to-file bind mounts.
 4. The FUSE bind mount uses `MS_BIND` (no `MS_NOEXEC` — executables must run from it).
 5. After `chroot`, `chdir` to the original working directory — it is accessible through FUSE passthrough.
-6. The controlling PTY is bind-mounted as `/dev/tty` only if one exists (i.e., stdin is connected to a TTY). If no controlling terminal exists, `/dev/tty` is not mounted, and `open("/dev/tty")` will return `ENXIO` which is correct behavior.
+6. The sandbox PTY slave path is bind-mounted as `/dev/tty` only when PTY mode is enabled. The final sandbox process does `setsid()`, opens `/dev/tty` inside the chroot, issues `ioctl(TIOCSCTTY)`, and then `dup2()` to stdin/stdout/stderr before `exec`. The parent relay is responsible for putting the host terminal into raw mode while forwarding input, stripping OSC palette replies before forwarding them, flushing buffered input on teardown, and propagating window size changes via `SIGWINCH` + `TIOCSWINSZ`.

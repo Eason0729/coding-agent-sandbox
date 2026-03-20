@@ -2,15 +2,17 @@ use std::ffi::CString;
 use std::os::fd::OwnedFd;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use log;
 use nix::poll::{poll, PollFd, PollFlags};
 use nix::pty::openpty;
-use nix::sys::termios::{tcgetattr, tcsetattr, LocalFlags, SetArg};
+use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+use nix::sys::termios::{cfmakeraw, tcflush, tcgetattr, tcsetattr, FlushArg, SetArg};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{fork, isatty, read, setsid, ttyname, ForkResult, Pid};
+use nix::unistd::{fork, isatty, read, setsid, ForkResult, Pid};
 
 use crate::fuse::policy::Policy;
 use crate::fuse::run_fuse;
@@ -24,6 +26,11 @@ use crate::cli::run::RunError;
 pub type Result<T> = std::result::Result<T, RunError>;
 
 const FUSE_READY_TIMEOUT: Duration = Duration::from_secs(10);
+static WINCH_PENDING: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handle_sigwinch(_: i32) {
+    WINCH_PENDING.store(true, Ordering::Relaxed);
+}
 
 pub struct RunContext {
     pub project_root: PathBuf,
@@ -68,7 +75,7 @@ fn wait_for_fuse_ready(mountpoint: &Path, fuse_child: Pid) -> Result<()> {
     let parent_dev = mountpoint
         .parent()
         .and_then(|p| std::fs::metadata(p).ok())
-        .map(|m| m.dev())
+        .map(|m: std::fs::Metadata| m.dev())
         .unwrap_or(u64::MAX);
 
     let deadline = Instant::now() + FUSE_READY_TIMEOUT;
@@ -203,51 +210,26 @@ fn exec_command(argv: &[String], use_pty: bool) -> Result<()> {
         setsid().map_err(|e| RunError::Pty(format!("setsid failed: {e}")))?;
 
         let tty = CString::new("/dev/tty").map_err(|_| RunError::InvalidCommandArg)?;
-        let tty_fd = unsafe { libc::open(tty.as_ptr(), libc::O_RDWR) };
-        if tty_fd < 0 {
+        let slave_fd = unsafe { libc::open(tty.as_ptr(), libc::O_RDWR) };
+        if slave_fd < 0 {
             return Err(RunError::Pty(format!(
                 "open /dev/tty failed: {}",
                 std::io::Error::last_os_error()
             )));
         }
 
-        let rc = unsafe { libc::ioctl(tty_fd, libc::TIOCSCTTY as _, 0) };
+        let rc = unsafe { libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0) };
         if rc < 0 {
-            let _ = unsafe { libc::close(tty_fd) };
+            let _ = unsafe { libc::close(slave_fd) };
             return Err(RunError::Pty(format!(
                 "TIOCSCTTY failed: {}",
                 std::io::Error::last_os_error()
             )));
         }
 
-        let mut termios = {
-            let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(tty_fd) };
-            match tcgetattr(&borrowed) {
-                Ok(t) => t,
-                Err(e) => {
-                    let _ = unsafe { libc::close(tty_fd) };
-                    return Err(RunError::Pty(format!("tcgetattr on slave failed: {e}")));
-                }
-            }
-        };
-        termios.local_flags.remove(
-            LocalFlags::ECHO
-                | LocalFlags::ECHOKE
-                | LocalFlags::ECHOE
-                | LocalFlags::ECHOK
-                | LocalFlags::ECHONL,
-        );
-        if let Err(e) = {
-            let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(tty_fd) };
-            tcsetattr(&borrowed, SetArg::TCSANOW, &termios)
-        } {
-            let _ = unsafe { libc::close(tty_fd) };
-            return Err(RunError::Pty(format!("tcsetattr on slave failed: {e}")));
-        }
-
         for stdfd in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
-            if unsafe { libc::dup2(tty_fd, stdfd) } < 0 {
-                let _ = unsafe { libc::close(tty_fd) };
+            if unsafe { libc::dup2(slave_fd, stdfd) } < 0 {
+                let _ = unsafe { libc::close(slave_fd) };
                 return Err(RunError::Pty(format!(
                     "dup2 to fd {stdfd} failed: {}",
                     std::io::Error::last_os_error()
@@ -255,7 +237,7 @@ fn exec_command(argv: &[String], use_pty: bool) -> Result<()> {
             }
         }
 
-        let _ = unsafe { libc::close(tty_fd) };
+        let _ = unsafe { libc::close(slave_fd) };
     }
 
     let program = CString::new(program.as_str()).map_err(|_| RunError::InvalidCommandArg)?;
@@ -299,19 +281,7 @@ pub fn run_in_sandbox(ctx: &RunContext, cmd_args: &[String]) -> Result<i32> {
     let mut pty_slave_path: Option<PathBuf> = None;
     if use_pty {
         let openpty_result = openpty(None, None).map_err(|e| RunError::Pty(e.to_string()))?;
-        let master = &openpty_result.master;
-        let mut termios =
-            tcgetattr(master).map_err(|e| RunError::Pty(format!("tcgetattr failed: {e}")))?;
-        termios.local_flags.remove(
-            LocalFlags::ECHO
-                | LocalFlags::ECHOKE
-                | LocalFlags::ECHOE
-                | LocalFlags::ECHOK
-                | LocalFlags::ECHONL,
-        );
-        tcsetattr(master, SetArg::TCSANOW, &termios)
-            .map_err(|e| RunError::Pty(format!("tcsetattr failed: {e}")))?;
-        let slave_path = ttyname(&openpty_result.slave)
+        let slave_path = nix::unistd::ttyname(&openpty_result.slave)
             .map_err(|e| RunError::Pty(format!("resolve slave tty path failed: {e}")))?;
         pty_master = Some(openpty_result.master);
         pty_slave_path = Some(slave_path);
@@ -341,7 +311,42 @@ fn relay_pty_io(master_fd: OwnedFd, child_pid: Pid) -> Result<i32> {
     let master_raw = master_fd.as_raw_fd();
     let mut stdin_open = true;
     let mut child_exit: Option<i32> = None;
+    let mut drain_deadline: Option<Instant> = None;
     let mut buf = [0u8; 8192];
+
+    let _stdin_guard = if isatty(stdin_fd).unwrap_or(false) {
+        let stdin_borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(stdin_fd) };
+        let mut termios = tcgetattr(stdin_borrowed)
+            .map_err(|e| RunError::Pty(format!("tcgetattr(stdin) failed: {e}")))?;
+        let original = termios.clone();
+        cfmakeraw(&mut termios);
+        tcsetattr(stdin_borrowed, SetArg::TCSANOW, &termios)
+            .map_err(|e| RunError::Pty(format!("tcsetattr(stdin) raw failed: {e}")))?;
+        Some(StdinTermiosGuard {
+            fd: stdin_fd,
+            termios: original,
+        })
+    } else {
+        None
+    };
+
+    let _sigwinch_guard = if isatty(stdin_fd).unwrap_or(false) {
+        let action = SigAction::new(
+            SigHandler::Handler(handle_sigwinch),
+            SaFlags::SA_RESTART,
+            SigSet::empty(),
+        );
+        // SAFETY: installs a minimal handler that only flips an atomic flag.
+        unsafe { sigaction(Signal::SIGWINCH, &action) }
+            .map_err(|e| RunError::Pty(format!("sigaction(SIGWINCH) failed: {e}")))?;
+        Some(SigwinchGuard {})
+    } else {
+        None
+    };
+
+    if isatty(stdin_fd).unwrap_or(false) {
+        update_pty_winsize(stdin_fd, master_raw)?;
+    }
 
     loop {
         let mut poll_fds = vec![PollFd::new(
@@ -366,6 +371,15 @@ fn relay_pty_io(master_fd: OwnedFd, child_pid: Pid) -> Result<i32> {
                 }
                 Ok(_) => {}
                 Err(e) => return Err(RunError::Pty(format!("waitpid failed: {e}"))),
+            }
+
+            if child_exit.is_some() && drain_deadline.is_none() {
+                if isatty(stdin_fd).unwrap_or(false) {
+                    let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(stdin_fd) };
+                    let _ = tcflush(borrowed, FlushArg::TCIFLUSH);
+                }
+                drain_deadline = Some(Instant::now() + Duration::from_millis(250));
+                stdin_open = false;
             }
         }
 
@@ -394,18 +408,75 @@ fn relay_pty_io(master_fd: OwnedFd, child_pid: Pid) -> Result<i32> {
         {
             match read(stdin_fd, &mut buf) {
                 Ok(0) => stdin_open = false,
-                Ok(n) => write_all_fd(master_raw, &buf[..n])?,
+                Ok(n) => {
+                    let filtered = &buf[..n];
+                    if !filtered.is_empty() {
+                        write_all_fd(master_raw, &filtered)?;
+                    }
+                }
                 Err(e) => {
                     return Err(RunError::Pty(format!("read from stdin failed: {e}")));
                 }
             }
         }
 
+        if WINCH_PENDING.swap(false, Ordering::Relaxed) && isatty(stdin_fd).unwrap_or(false) {
+            update_pty_winsize(stdin_fd, master_raw)?;
+        }
+
         if let Some(code) = child_exit {
-            return Ok(code);
+            if let Some(deadline) = drain_deadline {
+                if Instant::now() >= deadline {
+                    return Ok(code);
+                }
+            } else {
+                return Ok(code);
+            }
         }
     }
 }
+
+fn update_pty_winsize(stdin_fd: i32, master_fd: i32) -> Result<()> {
+    let mut winsz = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+
+    let rc = unsafe { libc::ioctl(stdin_fd, libc::TIOCGWINSZ, &mut winsz) };
+    if rc < 0 {
+        return Err(RunError::Pty(format!(
+            "ioctl(TIOCGWINSZ) failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    let rc = unsafe { libc::ioctl(master_fd, libc::TIOCSWINSZ, &winsz) };
+    if rc < 0 {
+        return Err(RunError::Pty(format!(
+            "ioctl(TIOCSWINSZ) failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    Ok(())
+}
+
+struct StdinTermiosGuard {
+    fd: i32,
+    termios: nix::sys::termios::Termios,
+}
+
+impl Drop for StdinTermiosGuard {
+    fn drop(&mut self) {
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(self.fd) };
+        let _ = tcsetattr(borrowed, SetArg::TCSANOW, &self.termios);
+        let _ = tcflush(borrowed, FlushArg::TCIFLUSH);
+    }
+}
+
+struct SigwinchGuard {}
 
 fn write_all_fd(fd: i32, mut data: &[u8]) -> Result<()> {
     while !data.is_empty() {

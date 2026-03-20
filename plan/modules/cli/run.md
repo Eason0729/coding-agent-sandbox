@@ -195,11 +195,12 @@ Already described above - forks the syncing daemon.
 
 ### Step 2: Second Fork (setup(1))
 
-After syncing daemon is ready, fork to create the setup(1) process. The controlling TTY path is captured **before** the fork using `ttyname(&std::io::stdin())` and passed through `SetupPayload`:
+After syncing daemon is ready, fork to create the setup(1) process. When PTY mode is enabled, the parent allocates a PTY pair and passes the slave path through `SetupPayload`:
 
 ```rust
-// Capture controlling TTY before fork (in run_in_sandbox)
-let controlling_tty = ttyname(&std::io::stdin()).ok();
+// Allocate PTY before fork (in run_in_sandbox)
+let openpty_result = openpty(None, None)?;
+let pty_slave = ttyname(&openpty_result.slave)?;
 
 match fork() {
     Ok(ForkResult::Child) => {
@@ -230,8 +231,8 @@ match fork() {
                 // Wait for FUSE to be ready (poll mountpoint)
                 wait_for_fuse_ready(&mountpoint);
                 
-                // Prepare chroot with /dev, /proc, fuse mount, and /dev/tty
-                prepare_chroot(&rootfs, &mountpoint, &cwd, &controlling_tty)?;
+                // Prepare chroot with /dev, /proc, fuse mount, and /dev/tty (PTY slave bind)
+                prepare_chroot(&rootfs, &mountpoint, &cwd, &pty_slave)?;
                 
                 // Chroot, apply seccomp, drop caps, exec
                 chroot_and_exec(&rootfs, &mut cmd)?;
@@ -246,7 +247,17 @@ match fork() {
 }
 ```
 
-The `SetupPayload` struct includes `controlling_tty: Option<PathBuf>` which carries the controlling TTY path from the parent process to the sandboxed process.
+The `SetupPayload` struct includes `pty_slave: Option<PathBuf>` which carries the allocated PTY slave path into setup(2).
+
+In setup(2), before `exec`, the process uses the following sequence when PTY is enabled:
+
+1. `setsid()`
+2. `open("/dev/tty", O_RDWR)`
+3. `ioctl(slave_fd, TIOCSCTTY, 0)`
+4. `dup2(slave_fd, 0/1/2)`
+5. `execvp(...)`
+
+The parent process keeps the PTY master and relays I/O between host stdio and the sandbox process. If the host stdin is a TTY, the relay temporarily switches the host stdin to raw mode so user keystrokes are forwarded once instead of being echoed twice by both the host terminal and the child shell, then flushes any buffered input when exiting. The relay also strips OSC palette replies (for example `OSC 10/11/12`) from stdin before forwarding them and handles `SIGWINCH` by copying the host terminal size to the PTY master with `TIOCSWINSZ`.
 
 ### Key Points
 
