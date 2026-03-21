@@ -27,6 +27,8 @@ pub fn apply_seccomp_filter() -> Result<()> {
 }
 
 const ALLOW_SYSCALLS: &[&str] = &[
+    "restart_syscall",
+    "shutdown",
     "pread",
     "pwrite",
     "wait",
