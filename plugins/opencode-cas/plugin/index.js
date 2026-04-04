@@ -1,4 +1,10 @@
-import { shellQuote, isHostEscape, buildCasWrappedCommand, resolveWorkdir, stripHostPrefix } from "./helpers.js";
+import {
+  shellQuote,
+  isHostEscape,
+  buildCasWrappedCommand,
+  resolveWorkdir,
+  stripHostPrefix,
+} from "./helpers.js";
 
 /**
  * @param {{ client: any, project: any, directory: string, worktree: string | null }} ctx

@@ -1,21 +1,36 @@
-# fuse/fs.rs — FUSE Orchestration with Overlay Merge
+# fuse/fs.rs — FUSE Adapter and Operation Dispatch
 
 ## Overview
 
-`fs.rs` implements `fuser::Filesystem` and handles:
+`fs.rs` implements `fuser::Filesystem` and is intentionally thin.
 
-- policy-based path routing (`Passthrough` / `FuseOnly` / `CopyOnWrite`)
-- inode/path bookkeeping
-- metadata daemon interaction
-- merged directory view and whiteout behavior
+`fs.rs` handles:
 
-`open_file.rs` now handles only direct backing-file I/O.
+- request/reply adaptation at the FUSE boundary
+- inode/path bookkeeping and open-handle lifecycle
+- operation flow orchestration (`load state -> decide -> execute`)
+
+Routing decisions and state classification are moved out of `fs.rs` into pure modules.
 
 ## Backing model
 
 - Real files: normal host FS path.
 - Managed files: object-store file path on host FS, obtained from syncing daemon (`object_id -> object path`).
 - Protocol carries metadata only; file bytes are never sent over daemon socket.
+
+## State/Decision architecture
+
+For each operation, `fs.rs` follows a strict sequence:
+
+1. Build operation state with `state_loader.rs` (always includes daemon read columns, even for `Passthrough`).
+2. Select behavior variant with `decision.rs` pure tables.
+3. Apply side effects with `executor.rs`.
+
+For `open`, `fs.rs` also captures an ordered transition trace from
+`decision.rs` and emits debug logs. This trace is side-effect free and can be
+validated in unit tests to guard against timing-sensitive regressions.
+
+This eliminates ad-hoc branching and makes behavior testable without mounting FUSE.
 
 ## Passthrough backing handle invariant
 
@@ -28,6 +43,17 @@ This is required because different open flags (read-only, write-only, append, tr
 - file/symlink: `RenameFile` metadata move.
 - directory: `RenameTree` metadata subtree move.
 - destination whiteout is removed after successful rename.
+
+## readdir behavior source of truth
+
+`readdir` child merge policy lives in `decision.rs` with explicit child-level outcomes,
+including:
+
+- real-only child
+- fuse-only child
+- both-present collision
+- whiteout masking
+- `Passthrough` collision `DontCare` classification
 
 ## Flush/release/fsync
 

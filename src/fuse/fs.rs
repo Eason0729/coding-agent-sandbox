@@ -1,9 +1,9 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::ops::Deref;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -13,10 +13,23 @@ use std::{fs, io};
 use fuser::*;
 
 use crate::error::{Error, Result};
+use crate::fuse::decision::{
+    choose_visible_child, decide_create, decide_mkdir, decide_open_with_transitions,
+    decide_readdir, decide_readlink, decide_rename, decide_rmdir, decide_setattr, decide_stat,
+    decide_unlink, validate_readdir_decision, OpenDecision, SetattrDecision, StatDecision,
+};
+use crate::fuse::executor::{
+    execute_create, execute_mkdir, execute_open, execute_readlink, execute_rename, execute_rmdir,
+    execute_symlink, execute_unlink,
+};
 use crate::fuse::inner::Inner;
 use crate::fuse::open_file::{OpenFile, TTL};
-use crate::fuse::policy::{AccessMode, Policy};
-use crate::syncing::proto::{EntryType, FileMetadata};
+use crate::fuse::policy::Policy;
+use crate::fuse::state_loader::{
+    load_create_state, load_mkdir_state, load_open_state, load_readdir_state, load_readlink_state,
+    load_rename_state, load_rmdir_state, load_setattr_state, load_stat_state, load_unlink_state,
+};
+use crate::syncing::proto::FileMetadata;
 
 fn err_to_errno(err: &Error) -> Errno {
     match err {
@@ -34,21 +47,6 @@ fn err_to_errno(err: &Error) -> Errno {
             crate::syncing::ClientError::Server(_) => Errno::EIO,
         },
     }
-}
-
-macro_rules! solve_error {
-    ($reply: ident, $err: expr) => {
-        match ($err) {
-            Ok(_) => {
-                $reply.ok();
-                return;
-            }
-            Err(err) => {
-                $reply.error(err);
-                return;
-            }
-        }
-    };
 }
 
 macro_rules! reply_error {
@@ -113,18 +111,12 @@ impl CasFuseFs {
     fn stat_path(&self, path: &Path) -> Result<(FileType, fuser::FileAttr)> {
         let mut client = self.get_sync_client()?;
 
-        match self.policy.classify(path) {
-            AccessMode::Passthrough => self.inner.stat_real_path(path),
-            AccessMode::FuseOnly => self.inner.stat_fuse_path(path, &mut client),
-            AccessMode::CopyOnWrite => {
-                let entry = client.get_entry(path.to_path_buf()).map_err(Error::from)?;
-                match entry {
-                    Some(e) if e.entry_type == EntryType::Whiteout => {
-                        Err(Error::from(std::io::Error::from_raw_os_error(libc::ENOENT)))
-                    }
-                    Some(_) => self.inner.stat_fuse_path(path, &mut client),
-                    None => self.inner.stat_real_path(path),
-                }
+        let state = load_stat_state(self.policy.as_ref(), path, &mut client)?;
+        match decide_stat(&state) {
+            StatDecision::UseReal => self.inner.stat_real_path(path),
+            StatDecision::UseFuse => self.inner.stat_fuse_path(path, &mut client),
+            StatDecision::NotFound => {
+                Err(Error::from(std::io::Error::from_raw_os_error(libc::ENOENT)))
             }
         }
     }
@@ -159,30 +151,6 @@ impl CasFuseFs {
             atime: now,
             ctime: now,
         }
-    }
-
-    fn open_options_from_flags(flags: OpenFlags) -> std::fs::OpenOptions {
-        // Kernel handles O_CREAT, O_EXCL, O_NOCTTY (libfuse docs)
-        // O_TRUNC is NOT filtered - it remains in flags
-        // O_APPEND: filesystem must handle if writeback caching is disabled
-        let mut opts = fs::OpenOptions::new();
-        match flags.acc_mode() {
-            OpenAccMode::O_RDONLY => {
-                opts.read(true);
-            }
-            OpenAccMode::O_WRONLY => {
-                // With writeback caching, kernel may send READ requests even for O_WRONLY
-                // (when partially writing uncached pages), so we need read access
-                opts.read(true).write(true);
-            }
-            OpenAccMode::O_RDWR => {
-                opts.read(true).write(true);
-            }
-        }
-        if (flags.0 & libc::O_APPEND) != 0 {
-            opts.append(true);
-        }
-        opts
     }
 
     fn recursive_real_descendants(path: &Path) -> Vec<PathBuf> {
@@ -253,7 +221,7 @@ impl Filesystem for CasFuseFs {
             InitFlags::FUSE_PARALLEL_DIROPS,
             InitFlags::FUSE_EXPORT_SUPPORT,
             InitFlags::FUSE_PASSTHROUGH,
-            InitFlags::FUSE_WRITEBACK_CACHE,
+            // InitFlags::FUSE_WRITEBACK_CACHE,
         ];
         for flag in FLAGS {
             config.add_capabilities(*flag).ok();
@@ -322,47 +290,51 @@ impl Filesystem for CasFuseFs {
             reply,
             self.connect_daemon().map_err(|err| err_to_errno(&err))
         );
-
-        if let Some(fh) = fh {
-            if let Some(mut of) = self.open_files.get_mut(&fh.0) {
-                if let Some(sz) = size {
-                    if let Err(e) = of.as_mut().set_len(sz) {
-                        reply.error(Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO)));
-                        return;
-                    }
-                }
-                if mode.is_some() || uid.is_some() || gid.is_some() {
-                    let mut perms = match of.as_mut().metadata() {
-                        Ok(m) => m.permissions(),
-                        Err(e) => {
-                            reply.error(Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO)));
-                            return;
+        let state = load_setattr_state(
+            self.policy.as_ref(),
+            &path,
+            fh.is_some(),
+            fh.map(|fh| self.open_files.get(&fh.0).is_some())
+                .unwrap_or(false),
+            mode,
+            uid,
+            gid,
+            size,
+        );
+        match decide_setattr(&state) {
+            SetattrDecision::UpdateOpenHandle => {
+                if let Some(fh) = fh {
+                    if let Some(mut of) = self.open_files.get_mut(&fh.0) {
+                        if let Some(sz) = size {
+                            if let Err(e) = of.as_mut().set_len(sz) {
+                                reply.error(Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO)));
+                                return;
+                            }
                         }
-                    };
-                    if let Some(m) = mode {
-                        perms.set_mode(m & 0o7777);
-                        let _ = of.as_mut().set_permissions(perms);
+                        if mode.is_some() || uid.is_some() || gid.is_some() {
+                            let mut perms = match of.as_mut().metadata() {
+                                Ok(m) => m.permissions(),
+                                Err(e) => {
+                                    reply.error(Errno::from_i32(
+                                        e.raw_os_error().unwrap_or(libc::EIO),
+                                    ));
+                                    return;
+                                }
+                            };
+                            if let Some(m) = mode {
+                                perms.set_mode(m & 0o7777);
+                                let _ = of.as_mut().set_permissions(perms);
+                            }
+                            let _ = nix::unistd::fchown(
+                                of.as_mut().as_raw_fd(),
+                                uid.map(nix::unistd::Uid::from_raw),
+                                gid.map(nix::unistd::Gid::from_raw),
+                            );
+                        }
                     }
-                    let _ = nix::unistd::fchown(
-                        of.as_mut().as_raw_fd(),
-                        uid.map(nix::unistd::Uid::from_raw),
-                        gid.map(nix::unistd::Gid::from_raw),
-                    );
                 }
-                if let Ok(meta) = of.as_mut().metadata() {
-                    let fmeta = Self::meta_from_stat(&meta);
-                    let _ = client.put_file_meta(path.clone(), fmeta);
-                }
-                match self.stat_path(&path) {
-                    Ok((_k, attr)) => reply.attr(&TTL, &attr),
-                    Err(err) => reply.error(err_to_errno(&err)),
-                }
-                return;
             }
-        }
-
-        match self.policy.classify(&path) {
-            AccessMode::Passthrough => {
+            SetattrDecision::UpdateRealFs => {
                 if let Some(sz) = size {
                     if let Err(e) = fs::OpenOptions::new()
                         .write(true)
@@ -384,7 +356,7 @@ impl Filesystem for CasFuseFs {
                     );
                 }
             }
-            AccessMode::FuseOnly | AccessMode::CopyOnWrite => {
+            SetattrDecision::UpdateDaemonMeta => {
                 if let Ok(Some(mut m)) = client.get_file_meta(path.clone()) {
                     if let Some(v) = mode {
                         m.mode = (m.mode & !0o7777) | (v & 0o7777);
@@ -417,18 +389,15 @@ impl Filesystem for CasFuseFs {
             reply,
             self.connect_daemon().map_err(|err| err_to_errno(&err))
         );
-        match client.get_entry(path.clone()) {
-            Ok(Some(entry)) if entry.entry_type == EntryType::Symlink => {
-                let data = entry.symlink_target.unwrap_or_default();
-                reply.data(&data);
-            }
-            Ok(Some(entry)) if entry.entry_type == EntryType::Whiteout => {
-                reply.error(Errno::ENOENT);
-            }
-            _ => match fs::read_link(&path) {
-                Ok(target) => reply.data(target.as_os_str().as_bytes()),
-                Err(e) => reply.error(Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO))),
-            },
+        let state = reply_error!(
+            reply,
+            load_readlink_state(self.policy.as_ref(), &path, &mut client)
+                .map_err(|err| err_to_errno(&err))
+        );
+        let decision = decide_readlink(&state);
+        match execute_readlink(decision, &mut client, &path) {
+            Ok(data) => reply.data(&data),
+            Err(err) => reply.error(err_to_errno(&err)),
         }
     }
 
@@ -446,25 +415,11 @@ impl Filesystem for CasFuseFs {
             reply,
             self.connect_daemon().map_err(|err| err_to_errno(&err))
         );
-        match self.policy.classify(&path) {
-            AccessMode::Passthrough => {
-                let res = fs::create_dir(&path).and_then(|_| {
-                    fs::set_permissions(&path, fs::Permissions::from_mode(mode & 0o7777))
-                });
-                if let Err(e) = res {
-                    reply.error(Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO)));
-                    return;
-                }
-            }
-            AccessMode::FuseOnly | AccessMode::CopyOnWrite => {
-                let meta =
-                    Self::file_meta_now(0, libc::S_IFDIR | (mode & 0o7777), req.uid(), req.gid());
-                if let Err(err) = client.put_dir(path.clone(), meta) {
-                    reply.error(err_to_errno(&Error::from(err)));
-                    return;
-                }
-                let _ = client.delete_whiteout(path.clone());
-            }
+        let state = load_mkdir_state(self.policy.as_ref(), &path);
+        let decision = decide_mkdir(&state);
+        if let Err(err) = execute_mkdir(decision, &mut client, &path, mode, req.uid(), req.gid()) {
+            reply.error(err_to_errno(&err));
+            return;
         }
 
         let ino = self.inodes.get_or_insert(&path);
@@ -500,51 +455,36 @@ impl Filesystem for CasFuseFs {
             reply,
             self.connect_daemon().map_err(|err| err_to_errno(&err))
         );
-        match self.policy.classify(&path) {
-            AccessMode::Passthrough => match fs::remove_file(&path) {
-                Ok(()) => reply.ok(),
-                Err(e) => reply.error(Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO))),
-            },
-            AccessMode::FuseOnly | AccessMode::CopyOnWrite => {
-                let _ = client.delete_file(path.clone());
-                match client.put_whiteout(path) {
-                    Ok(()) => reply.ok(),
-                    Err(err) => reply.error(err_to_errno(&Error::from(err))),
-                }
-            }
+        let state = reply_error!(
+            reply,
+            load_unlink_state(self.policy.as_ref(), &path).map_err(|err| err_to_errno(&err))
+        );
+        let decision = decide_unlink(&state);
+        match execute_unlink(decision, &mut client, &path) {
+            Ok(()) => reply.ok(),
+            Err(err) => reply.error(err_to_errno(&err)),
         }
     }
 
     fn rmdir(&self, req: &Request, parent: INodeNo, component: &OsStr, reply: ReplyEmpty) {
         let path = get_path!(self, reply, parent, component);
 
-        let access = self.policy.classify(&path);
-
-        match access {
-            AccessMode::Passthrough => solve_error!(
-                reply,
-                fs::remove_dir(&path)
-                    .map_err(|e| Errno::from_i32(e.raw_os_error().unwrap_or_default()))
-            ),
-            AccessMode::FuseOnly | AccessMode::CopyOnWrite => {
-                let mut daemon = match self.connect_daemon() {
-                    Ok(v) => v,
-                    Err(err) => {
-                        reply.error(err_to_errno(&err));
-                        return;
-                    }
-                };
-                let _ = daemon.delete_file(path.clone());
-                let descendants = Self::recursive_real_descendants(&path);
-                if let Err(err) = daemon.put_whiteout(path.clone()) {
-                    reply.error(err_to_errno(&Error::from(err)));
-                    return;
-                }
-                for p in descendants {
-                    let _ = daemon.put_whiteout(p);
-                }
-                reply.ok()
+        let mut daemon = match self.connect_daemon() {
+            Ok(v) => v,
+            Err(err) => {
+                reply.error(err_to_errno(&err));
+                return;
             }
+        };
+        let state = reply_error!(
+            reply,
+            load_rmdir_state(self.policy.as_ref(), &path).map_err(|err| err_to_errno(&err))
+        );
+        let decision = decide_rmdir(&state);
+        let descendants = Self::recursive_real_descendants(&path);
+        match execute_rmdir(decision, &mut daemon, &path, &descendants) {
+            Ok(()) => reply.ok(),
+            Err(err) => reply.error(err_to_errno(&err)),
         }
     }
 
@@ -560,33 +500,19 @@ impl Filesystem for CasFuseFs {
     ) {
         let from = get_path!(self, reply, parent, name);
         let to = get_path!(self, reply, newparent, newname);
-        match self.policy.classify(&from) {
-            AccessMode::Passthrough => solve_error!(
-                reply,
-                fs::rename(&from, &to)
-                    .map_err(|e| Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO)))
-            ),
-            AccessMode::FuseOnly | AccessMode::CopyOnWrite => {
-                let mut client = reply_error!(
-                    reply,
-                    self.connect_daemon().map_err(|err| err_to_errno(&err))
-                );
-
-                let is_dir = client
-                    .get_entry(from.clone())
-                    .ok()
-                    .flatten()
-                    .map(|e| e.entry_type == EntryType::Dir)
-                    .unwrap_or(false);
-                let res = if is_dir {
-                    client.rename_tree(from.clone(), to.clone())
-                } else {
-                    client.rename_file(from.clone(), to.clone())
-                };
-                reply_error!(reply, res.map_err(|err| err_to_errno(&Error::from(err))));
-                client.delete_whiteout(to).ok();
-                reply.ok();
-            }
+        let mut client = reply_error!(
+            reply,
+            self.connect_daemon().map_err(|err| err_to_errno(&err))
+        );
+        let state = reply_error!(
+            reply,
+            load_rename_state(self.policy.as_ref(), &from, &to, &mut client)
+                .map_err(|err| err_to_errno(&err))
+        );
+        let decision = decide_rename(&state);
+        match execute_rename(decision, &mut client, &from, &to) {
+            Ok(()) => reply.ok(),
+            Err(err) => reply.error(err_to_errno(&err)),
         }
     }
 
@@ -599,33 +525,22 @@ impl Filesystem for CasFuseFs {
         reply: ReplyEntry,
     ) {
         let path = get_path!(self, reply, parent, name);
-        match self.policy.classify(&path) {
-            AccessMode::Passthrough => reply_error!(
-                reply,
-                std::os::unix::fs::symlink(target, &path)
-                    .map_err(|e| Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO)))
-            ),
-            AccessMode::FuseOnly | AccessMode::CopyOnWrite => {
-                let mut client = reply_error!(
-                    reply,
-                    self.connect_daemon().map_err(|err| err_to_errno(&err))
-                );
-                let meta = Self::file_meta_now(
-                    target.as_os_str().as_bytes().len() as u64,
-                    libc::S_IFLNK | 0o777,
-                    req.uid(),
-                    req.gid(),
-                );
-
-                reply_error!(
-                    reply,
-                    client
-                        .put_symlink(path.clone(), target.as_os_str().as_bytes().to_vec(), meta)
-                        .map_err(|err| err_to_errno(&Error::from(err)))
-                );
-                client.delete_whiteout(path.clone()).ok();
-            }
-        }
+        let mut client = reply_error!(
+            reply,
+            self.connect_daemon().map_err(|err| err_to_errno(&err))
+        );
+        let meta = Self::file_meta_now(
+            target.as_os_str().as_bytes().len() as u64,
+            libc::S_IFLNK | 0o777,
+            req.uid(),
+            req.gid(),
+        );
+        let access = self.policy.classify(&path);
+        reply_error!(
+            reply,
+            execute_symlink(access, &mut client, &path, target, meta)
+                .map_err(|err| err_to_errno(&err))
+        );
         match self.stat_path(&path) {
             Ok((_kind, attr)) => reply.entry(&TTL, &attr, fuser::Generation(0)),
             Err(err) => reply.error(err_to_errno(&err)),
@@ -656,7 +571,6 @@ impl Filesystem for CasFuseFs {
             reply,
             self.connect_daemon().map_err(|err| err_to_errno(&err))
         );
-        let access = self.policy.classify(&path);
 
         let need_write = matches!(
             flags.acc_mode(),
@@ -664,91 +578,48 @@ impl Filesystem for CasFuseFs {
         );
         let truncate_requested = (flags.0 & libc::O_TRUNC) != 0;
 
-        let entry = reply_error!(
+        let state = reply_error!(
             reply,
-            client
-                .get_entry(path.clone())
-                .map_err(|err| err_to_errno(&Error::from(err)))
+            load_open_state(
+                self.policy.as_ref(),
+                &path,
+                need_write,
+                truncate_requested,
+                &mut client,
+            )
+            .map_err(|err| err_to_errno(&err))
         );
-        if entry
-            .as_ref()
-            .map_or(false, |e| e.entry_type == EntryType::Whiteout)
-        {
+        let (decision, transitions) = decide_open_with_transitions(&state);
+        log::debug!(
+            "fuse.open.plan path={} need_write={} truncate={} decision={:?} transitions={:?}",
+            path.display(),
+            need_write,
+            truncate_requested,
+            decision,
+            transitions,
+        );
+        if matches!(&decision, OpenDecision::NotFound) {
             reply.error(Errno::ENOENT);
             return;
         }
-
-        let object_id = entry.as_ref().and_then(|x| x.object_id);
-        let object_path = object_id.and_then(|id| client.get_object_path(id).ok());
-
-        macro_rules! ensure {
-            ($opt:expr, $field:tt) => {
-                match $opt {
-                    Some(v) => v,
-                    None => {
-                        let meta =
-                            Self::file_meta_now(0, libc::S_IFREG | 0o644, req.uid(), req.gid());
-                        reply_error!(
-                            reply,
-                            client
-                                .ensure_file_object(path.clone(), meta)
-                                .map_err(|e| err_to_errno(&Error::from(e)))
-                        )
-                        .$field
-                    }
-                }
-            };
+        if matches!(&decision, OpenDecision::Error) {
+            reply.error(Errno::EIO);
+            return;
         }
 
-        let (target_path, object_id) = match access {
-            AccessMode::Passthrough => (path.clone(), None),
-            AccessMode::FuseOnly => {
-                let oid = ensure!(object_id, 0);
-                let p = ensure!(object_path, 1);
-                (p, Some(oid))
-            }
-            AccessMode::CopyOnWrite => {
-                if !need_write {
-                    match (object_id, object_path) {
-                        (Some(oid), Some(p)) => (p, Some(oid)),
-                        (Some(_), None) => {
-                            reply.error(Errno::EIO);
-                            return;
-                        }
-                        (None, _) => (path.clone(), None),
-                    }
-                } else {
-                    let had_object = object_id.is_some();
-                    let oid = ensure!(object_id, 0);
-                    let p = ensure!(object_path, 1);
-                    if !had_object && !truncate_requested {
-                        if path.exists() {
-                            reply_error!(
-                                reply,
-                                fs::copy(&path, &p).map_err(|e| {
-                                    Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO))
-                                })
-                            );
-                        }
-                    }
-                    let _ = client.delete_whiteout(path.clone());
-                    (p, Some(oid))
-                }
-            }
-        };
-
-        let file = reply_error!(
+        let default_meta = Self::file_meta_now(0, libc::S_IFREG | 0o644, req.uid(), req.gid());
+        let opened = reply_error!(
             reply,
-            Self::open_options_from_flags(flags)
-                .open(&target_path)
-                .map_err(|e| Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO)))
+            execute_open(decision, &mut client, &path, flags, default_meta)
+                .map_err(|err| err_to_errno(&err))
         );
-        let state = match object_id {
+
+        let state = match opened.object_id {
             Some(id) => OpenFile::PassthroughObject {
-                file,
+                file: opened.file,
                 object_id: id,
             },
-            None => OpenFile::PassthroughReal { file },
+            None => OpenFile::PassthroughReal { file: opened.file },
         };
 
         let fh = self.alloc_fh();
@@ -782,44 +653,21 @@ impl Filesystem for CasFuseFs {
             self.connect_daemon().map_err(|err| err_to_errno(&err))
         );
         let raw_flags = flags;
-
-        let state = match self.policy.classify(&path) {
-            AccessMode::Passthrough => {
-                let mut opts = Self::open_options_from_flags(OpenFlags(raw_flags));
-                opts.create(true).mode(mode);
-                match opts.open(&path) {
-                    Ok(file) => OpenFile::PassthroughReal { file },
-                    Err(e) => {
-                        reply.error(Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO)));
-                        return;
-                    }
-                }
-            }
-            AccessMode::FuseOnly | AccessMode::CopyOnWrite => {
-                let meta =
-                    Self::file_meta_now(0, libc::S_IFREG | (mode & 0o7777), req.uid(), req.gid());
-                let (oid, object_path) = match client.ensure_file_object(path.clone(), meta) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        reply.error(err_to_errno(&Error::from(err)));
-                        return;
-                    }
-                };
-                let _ = client.delete_whiteout(path.clone());
-                let mut opts = Self::open_options_from_flags(OpenFlags(raw_flags));
-                opts.create(true).mode(mode);
-                match opts.open(&object_path) {
-                    Ok(file) => OpenFile::PassthroughObject {
-                        file,
-                        object_id: oid,
-                    },
-                    Err(e) => {
-                        reply.error(Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO)));
-                        return;
-                    }
-                }
-            }
-        };
+        let create_state = load_create_state(self.policy.as_ref(), &path);
+        let create_decision = decide_create(&create_state);
+        let meta = Self::file_meta_now(0, libc::S_IFREG | (mode & 0o7777), req.uid(), req.gid());
+        let state = reply_error!(
+            reply,
+            execute_create(
+                create_decision,
+                &mut client,
+                &path,
+                mode,
+                OpenFlags(raw_flags),
+                meta,
+            )
+            .map_err(|err| err_to_errno(&err))
+        );
 
         let fh = self.alloc_fh();
         let backing_id: Option<Arc<BackingId>> = match &state {
@@ -1142,47 +990,25 @@ impl Filesystem for CasFuseFs {
 
         let mut items: BTreeMap<Vec<u8>, (FileType, PathBuf)> = BTreeMap::new();
 
-        if self.policy.classify(&path) != AccessMode::FuseOnly {
-            if let Ok(rd) = fs::read_dir(&path) {
-                for ent in rd.flatten() {
-                    let name = ent.file_name().as_bytes().to_vec();
-                    let p = ent.path();
-                    let kind = match ent.file_type() {
-                        Ok(t) if t.is_dir() => FileType::Directory,
-                        Ok(t) if t.is_symlink() => FileType::Symlink,
-                        _ => FileType::RegularFile,
-                    };
-                    items.insert(name, (kind, p));
-                }
-            }
-        }
-
         let mut client = reply_error!(
             reply,
             self.connect_daemon().map_err(|err| err_to_errno(&err))
         );
-        if let Ok(fuse_entries) = client.read_dir_all(path.clone()) {
-            let mut whiteouts = HashSet::new();
-            for (child_path, entry) in fuse_entries {
-                let Some(name) = child_path.file_name() else {
-                    continue;
-                };
-                let key = name.as_bytes().to_vec();
-                if entry.entry_type == EntryType::Whiteout {
-                    whiteouts.insert(key.clone());
-                    items.remove(&key);
-                    continue;
-                }
-                let kind = match entry.entry_type {
-                    EntryType::Dir => FileType::Directory,
-                    EntryType::Symlink => FileType::Symlink,
-                    EntryType::File => FileType::RegularFile,
-                    EntryType::Whiteout => continue,
-                };
-                items.insert(key, (kind, child_path));
-            }
-            for w in whiteouts {
-                items.remove(&w);
+
+        let state = reply_error!(
+            reply,
+            load_readdir_state(self.policy.as_ref(), &path, &mut client)
+                .map_err(|err| err_to_errno(&err))
+        );
+        let decision = decide_readdir(&state);
+        reply_error!(
+            reply,
+            validate_readdir_decision(&state, &decision).map_err(|err| err_to_errno(&err))
+        );
+
+        for (name, child_decision) in &decision.per_child {
+            if let Some((kind, full)) = choose_visible_child(&state, name, *child_decision) {
+                items.insert(name.clone(), (kind, full));
             }
         }
 
