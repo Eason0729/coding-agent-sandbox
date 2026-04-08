@@ -17,11 +17,11 @@ This module defines the binary layout of the SHM region and provides safe getter
 The SHM region contains:
 
 ```
-+----------------+----------------+----------------+
-| mutex (40B)    | running_count  | socket_ready   |
-| (pthread_mutex_t, process-shared) | (u32)      | (AtomicU32)   |
-+----------------+----------------+----------------+
-0                40               44               48
++-----------------------------------+----------------+---------------+
+|             mutex (40B)           | running_count  | socket_ready  |
+| (pthread_mutex_t, process-shared) |     (u32)      | (AtomicU32)   |
++-----------------------------------+----------------+---------------+
+0                                   40               44             48
 ```
 
 Size: 48 bytes minimum (rounded up to 64 for alignment).
