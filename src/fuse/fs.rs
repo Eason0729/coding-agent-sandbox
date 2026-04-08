@@ -185,6 +185,21 @@ fn check_export_component(component: &OsStr) -> bool {
     false
 }
 
+/// Returns true if `path` ends with `-wal` (SQLite WAL journal file).
+///
+/// The `-wal` file needs `FOPEN_DIRECT_IO` to bypass the kernel page cache
+/// and ensure write-through semantics for journal durability.
+///
+/// The `-shm` file is intentionally excluded: it is mmap-ed with `MAP_SHARED`
+/// for the WAL-index, and the kernel's direct-I/O mmap path for FUSE files
+/// has known edge cases. Cached mode handles `MAP_SHARED` correctly.
+fn is_sqlite_wal_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.ends_with("-wal"))
+        .unwrap_or(false)
+}
+
 macro_rules! get_path {
     ($self:ident, $rep: ident, $parent: expr) => {
         match $self.path_of($parent) {
@@ -221,7 +236,8 @@ impl Filesystem for CasFuseFs {
             InitFlags::FUSE_PARALLEL_DIROPS,
             InitFlags::FUSE_EXPORT_SUPPORT,
             InitFlags::FUSE_PASSTHROUGH,
-            // InitFlags::FUSE_WRITEBACK_CACHE,
+            InitFlags::FUSE_DIRECT_IO_ALLOW_MMAP,
+            InitFlags::FUSE_POSIX_LOCKS,
         ];
         for flag in FLAGS {
             config.add_capabilities(*flag).ok();
@@ -623,17 +639,38 @@ impl Filesystem for CasFuseFs {
         };
 
         let fh = self.alloc_fh();
-        let backing_id: Option<Arc<BackingId>> = match &state {
-            OpenFile::PassthroughReal { file } | OpenFile::PassthroughObject { file, .. } => {
-                reply.open_backing(file).map(Arc::new).ok()
+
+        // SQLite WAL/SHM files must NOT use passthrough.
+        // FOPEN_PASSTHROUGH + FOPEN_DIRECT_IO conflict in the kernel's async I/O
+        // path (used by bun/Drizzle). For these files, use normal FUSE I/O with
+        // FOPEN_DIRECT_IO and our setlk/getlk handlers.
+        let is_sqlite = is_sqlite_wal_file(&path);
+
+        let backing_id: Option<Arc<BackingId>> = if !is_sqlite {
+            match &state {
+                OpenFile::PassthroughReal { file } | OpenFile::PassthroughObject { file, .. } => {
+                    reply.open_backing(file).map(Arc::new).ok()
+                }
             }
+        } else {
+            None
         };
+
         self.open_files.insert(fh, state);
+
+        let open_flags = if is_sqlite {
+            FopenFlags::FOPEN_DIRECT_IO
+        } else {
+            FopenFlags::empty()
+        };
+
         match backing_id {
-            Some(id) => {
-                reply.opened_passthrough(FileHandle(fh), FopenFlags::FOPEN_PASSTHROUGH, &id)
-            }
-            None => reply.opened(FileHandle(fh), FopenFlags::empty()),
+            Some(id) => reply.opened_passthrough(
+                FileHandle(fh),
+                FopenFlags::FOPEN_PASSTHROUGH | open_flags,
+                &id,
+            ),
+            None => reply.opened(FileHandle(fh), open_flags),
         }
     }
 
@@ -670,11 +707,19 @@ impl Filesystem for CasFuseFs {
         );
 
         let fh = self.alloc_fh();
-        let backing_id: Option<Arc<BackingId>> = match &state {
-            OpenFile::PassthroughReal { file } | OpenFile::PassthroughObject { file, .. } => {
-                reply.open_backing(file).map(Arc::new).ok()
+
+        let is_sqlite = is_sqlite_wal_file(&path);
+
+        let backing_id: Option<Arc<BackingId>> = if !is_sqlite {
+            match &state {
+                OpenFile::PassthroughReal { file } | OpenFile::PassthroughObject { file, .. } => {
+                    reply.open_backing(file).map(Arc::new).ok()
+                }
             }
+        } else {
+            None
         };
+
         self.open_files.insert(fh, state);
         let attr = match self.stat_path(&path) {
             Ok((_kind, attr)) => attr,
@@ -699,6 +744,12 @@ impl Filesystem for CasFuseFs {
                 }
             }
         };
+        let open_flags = if is_sqlite {
+            FopenFlags::FOPEN_DIRECT_IO
+        } else {
+            FopenFlags::empty()
+        };
+
         match backing_id {
             Some(id) => {
                 reply.created_passthrough(
@@ -706,7 +757,7 @@ impl Filesystem for CasFuseFs {
                     &attr,
                     fuser::Generation(0),
                     FileHandle(fh),
-                    FopenFlags::empty(),
+                    open_flags,
                     &id,
                 );
             }
@@ -715,7 +766,7 @@ impl Filesystem for CasFuseFs {
                 &attr,
                 fuser::Generation(0),
                 FileHandle(fh),
-                FopenFlags::empty(),
+                open_flags,
             ),
         }
     }
@@ -1090,14 +1141,25 @@ impl Filesystem for CasFuseFs {
     fn fallocate(
         &self,
         _req: &Request,
-        ino: INodeNo,
+        _ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         length: u64,
         mode: i32,
         reply: ReplyEmpty,
     ) {
-        reply.ok();
+        let res = match self.open_files.get(&fh.0) {
+            Some(of) => {
+                let fd = of.as_ref().as_raw_fd();
+                unsafe { libc::fallocate(fd, mode, offset as _, length as _) }
+            }
+            None => -1,
+        };
+        if res == 0 {
+            reply.ok();
+        } else {
+            reply.error(Errno::from_i32(nix::errno::Errno::last_raw()));
+        }
     }
 
     fn fsyncdir(
@@ -1125,5 +1187,94 @@ impl Filesystem for CasFuseFs {
         e.set(PollEvents::POLLIN, true);
         e.set(PollEvents::POLLOUT, true);
         reply.poll(e);
+    }
+
+    fn setlk(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _lock_owner: LockOwner,
+        start: u64,
+        end: u64,
+        typ: i32,
+        _pid: u32,
+        sleep: bool,
+        reply: ReplyEmpty,
+    ) {
+        let res = match self.open_files.get(&fh.0) {
+            Some(of) => {
+                let fd = of.as_ref().as_raw_fd();
+                let flock = libc::flock {
+                    l_type: typ as _,
+                    l_whence: libc::SEEK_SET as _,
+                    l_start: start as _,
+                    l_len: if end == u64::MAX {
+                        0
+                    } else {
+                        (end.saturating_sub(start) + 1) as _
+                    },
+                    l_pid: 0,
+                };
+                let cmd = if sleep { libc::F_SETLKW } else { libc::F_SETLK };
+                unsafe { libc::fcntl(fd, cmd, &flock) }
+            }
+            None => -1,
+        };
+        if res == 0 {
+            reply.ok();
+        } else {
+            reply.error(Errno::from_i32(nix::errno::Errno::last_raw()));
+        }
+    }
+
+    fn getlk(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _lock_owner: LockOwner,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        reply: ReplyLock,
+    ) {
+        let res = match self.open_files.get(&fh.0) {
+            Some(of) => {
+                let fd = of.as_ref().as_raw_fd();
+                let mut flock = libc::flock {
+                    l_type: typ as _,
+                    l_whence: libc::SEEK_SET as _,
+                    l_start: start as _,
+                    l_len: if end == u64::MAX {
+                        0
+                    } else {
+                        (end.saturating_sub(start) + 1) as _
+                    },
+                    l_pid: pid as _,
+                };
+                let ret = unsafe { libc::fcntl(fd, libc::F_GETLK, &mut flock) };
+                if ret == 0 {
+                    Some((
+                        flock.l_type,
+                        flock.l_start as u64,
+                        flock.l_len as u64,
+                        flock.l_pid as u32,
+                    ))
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+        match res {
+            Some((l_type, l_start, l_len, l_pid)) => {
+                reply.locked(l_start, l_len, l_type as _, l_pid);
+            }
+            None => {
+                reply.error(Errno::from_i32(nix::errno::Errno::last_raw()));
+            }
+        }
     }
 }
