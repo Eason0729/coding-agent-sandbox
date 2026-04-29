@@ -88,6 +88,17 @@ To avoid stale SHM/socket races and silent hangs:
 3. Waiting is bounded (timeout) and returns an explicit run error on failure.
 4. Timeout should be generous enough to avoid false negatives on busy hosts (15s).
 
+## Cargo Compatibility
+
+When running `cargo` commands in sandbox:
+
+1. If `CARGO_HOME` is already set by user, keep it unchanged.
+2. If unset, set it to `<cwd>/.cas-cargo-home` before `exec`.
+3. Ensure this directory exists.
+
+This avoids relying on `$HOME/.cargo` policy for sqlite-backed Cargo cache
+state, so `cargo build` works even when `$HOME/.cargo` is not whitelisted.
+
 ## Running Count Safety
 
 `running_count` must be decremented on every early-return error path after increment.
@@ -252,7 +263,7 @@ The `SetupPayload` struct includes `pty_slave: Option<PathBuf>` which carries th
 In setup(2), before `exec`, the process uses the following sequence when PTY is enabled:
 
 1. `setsid()`
-2. `open("/dev/tty", O_RDWR)`
+2. `open("/dev/tty", O_RDWR)` (requires `rootfs/dev/tty` to be precreated and bind-mounted)
 3. `ioctl(slave_fd, TIOCSCTTY, 0)`
 4. `dup2(slave_fd, 0/1/2)`
 5. `execvp(...)`

@@ -10,6 +10,9 @@ Protocol never transfers file content bytes. It only manages:
 
 Object file content is written/read by FUSE via normal filesystem syscalls.
 
+First-write copy-up of an existing real file may be materialized atomically on
+the syncing server before the metadata entry is published.
+
 ## Core data types
 
 ```rust

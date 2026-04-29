@@ -175,24 +175,33 @@ impl CasFuseFs {
 
 /// Check if component is a `export`(man page term)
 ///
-/// `export` is OS-specific, but for unix '..' is fine.
+/// `export` is OS-specific, but for unix '.' and '..' are fine.
 fn check_export_component(component: &OsStr) -> bool {
     let component = component.as_encoded_bytes();
-    if component.len() == 2 && component[0] == b'.' && component[1] == b'.' {
+    if (component.len() == 1 && component[0] == b'.')
+        || (component.len() == 2 && component[0] == b'.' && component[1] == b'.')
+    {
         return true;
     }
 
     false
 }
 
-/// Returns true if `path` ends with `-wal` (SQLite WAL journal file).
+/// Returns true if `path` ends with `-wal` or `-shm` (SQLite WAL sidecar files).
 ///
-/// The `-wal` file needs `FOPEN_DIRECT_IO` to bypass the kernel page cache
-/// and ensure write-through semantics for journal durability.
+/// Both files must avoid `FOPEN_PASSTHROUGH`; otherwise the kernel can bypass
+/// our FUSE lock handlers, which leads to broken SQLite cache bookkeeping
+/// (Cargo's global-cache sqlite DB can become malformed).
 ///
-/// The `-shm` file is intentionally excluded: it is mmap-ed with `MAP_SHARED`
-/// for the WAL-index, and the kernel's direct-I/O mmap path for FUSE files
-/// has known edge cases. Cached mode handles `MAP_SHARED` correctly.
+/// Only `-wal` uses `FOPEN_DIRECT_IO` for journal durability semantics.
+/// `-shm` remains cached so `MAP_SHARED` WAL-index access keeps working.
+fn is_sqlite_sidecar_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.ends_with("-wal") || n.ends_with("-shm"))
+        .unwrap_or(false)
+}
+
 fn is_sqlite_wal_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
@@ -213,12 +222,15 @@ macro_rules! get_path {
     ($self:ident, $reply: ident, $parent: expr, $comp: ident) => {
         match $self.path_of($parent) {
             Some(mut path) => {
-                if check_export_component($comp) {
+                if $comp.as_encoded_bytes() == b"." {
+                    path
+                } else if check_export_component($comp) {
                     path.pop();
+                    path
                 } else {
-                    path.push($comp)
-                };
-                path
+                    path.push($comp);
+                    path
+                }
             }
             None => {
                 $reply.error(Errno::ENOENT);
@@ -640,13 +652,12 @@ impl Filesystem for CasFuseFs {
 
         let fh = self.alloc_fh();
 
-        // SQLite WAL/SHM files must NOT use passthrough.
-        // FOPEN_PASSTHROUGH + FOPEN_DIRECT_IO conflict in the kernel's async I/O
-        // path (used by bun/Drizzle). For these files, use normal FUSE I/O with
-        // FOPEN_DIRECT_IO and our setlk/getlk handlers.
-        let is_sqlite = is_sqlite_wal_file(&path);
+        // SQLite WAL/SHM sidecars must NOT use passthrough.
+        // For WAL specifically, also force DIRECT_IO.
+        let is_sqlite_sidecar = is_sqlite_sidecar_file(&path);
+        let is_sqlite_wal = is_sqlite_wal_file(&path);
 
-        let backing_id: Option<Arc<BackingId>> = if !is_sqlite {
+        let backing_id: Option<Arc<BackingId>> = if !is_sqlite_sidecar {
             match &state {
                 OpenFile::PassthroughReal { file } | OpenFile::PassthroughObject { file, .. } => {
                     reply.open_backing(file).map(Arc::new).ok()
@@ -658,7 +669,7 @@ impl Filesystem for CasFuseFs {
 
         self.open_files.insert(fh, state);
 
-        let open_flags = if is_sqlite {
+        let open_flags = if is_sqlite_wal {
             FopenFlags::FOPEN_DIRECT_IO
         } else {
             FopenFlags::empty()
@@ -708,9 +719,10 @@ impl Filesystem for CasFuseFs {
 
         let fh = self.alloc_fh();
 
-        let is_sqlite = is_sqlite_wal_file(&path);
+        let is_sqlite_sidecar = is_sqlite_sidecar_file(&path);
+        let is_sqlite_wal = is_sqlite_wal_file(&path);
 
-        let backing_id: Option<Arc<BackingId>> = if !is_sqlite {
+        let backing_id: Option<Arc<BackingId>> = if !is_sqlite_sidecar {
             match &state {
                 OpenFile::PassthroughReal { file } | OpenFile::PassthroughObject { file, .. } => {
                     reply.open_backing(file).map(Arc::new).ok()
@@ -744,7 +756,7 @@ impl Filesystem for CasFuseFs {
                 }
             }
         };
-        let open_flags = if is_sqlite {
+        let open_flags = if is_sqlite_wal {
             FopenFlags::FOPEN_DIRECT_IO
         } else {
             FopenFlags::empty()
@@ -1165,12 +1177,20 @@ impl Filesystem for CasFuseFs {
     fn fsyncdir(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         _fh: FileHandle,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        reply.ok();
+        let Some(path) = self.path_of(ino) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+
+        match fs::File::open(&path).and_then(|f| f.sync_all()) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(Errno::from_i32(e.raw_os_error().unwrap_or(libc::EIO))),
+        }
     }
 
     fn poll(

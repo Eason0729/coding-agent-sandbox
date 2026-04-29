@@ -37,12 +37,6 @@ pub fn execute_open(
     flags: OpenFlags,
     default_meta: FileMetadata,
 ) -> Result<OpenExecResult> {
-    let mut ensure_object = || -> Result<(u64, PathBuf)> {
-        client
-            .ensure_file_object(path.to_path_buf(), default_meta.clone())
-            .map_err(Error::from)
-    };
-
     let mut options = fs::OpenOptions::new();
     match flags.acc_mode() {
         fuser::OpenAccMode::O_RDONLY => {
@@ -76,7 +70,15 @@ pub fn execute_open(
             delete_whiteout,
         } => {
             let (oid, object_path) = if needs_ensure {
-                ensure_object()?
+                if copy_up_from_real {
+                    client
+                        .ensure_file_object_from_real(path.to_path_buf(), default_meta.clone())
+                        .map_err(Error::from)?
+                } else {
+                    client
+                        .ensure_file_object(path.to_path_buf(), default_meta.clone())
+                        .map_err(Error::from)?
+                }
             } else {
                 let oid = existing_object_id
                     .ok_or_else(|| Error::from(std::io::Error::from_raw_os_error(libc::EIO)))?;

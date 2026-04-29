@@ -34,6 +34,11 @@ pub struct ConfigPolicy {
     /// Whether the project root directory itself is implicitly whitelisted.
     /// Set to `false` only when the user explicitly blacklisted it.
     root_is_whitelisted: bool,
+
+    /// Optional extra implicit passthrough anchor (current working directory).
+    /// Applied to the full subtree unless explicitly blacklisted.
+    cwd: Option<PathBuf>,
+    cwd_is_whitelisted: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -68,7 +73,12 @@ impl ConfigPolicy {
     ///   matches the user-provided whitelist.
     /// * The project root itself (relative path `""`) is treated as passthrough
     ///   unless it matches the user-provided blacklist.
-    pub fn from_config(config: &Config, root: &Path) -> Result<Self, GlobError> {
+    /// * `cwd` subtree is also treated as passthrough unless it is blacklisted.
+    pub fn from_config(
+        config: &Config,
+        root: &Path,
+        cwd: Option<&Path>,
+    ) -> Result<Self, GlobError> {
         // Build user-only sets for implicit-rule checks (no implicit rules yet).
         let user_whitelist = build_globset(&config.whitelist)?;
         let user_blacklist = build_globset(&config.blacklist)?;
@@ -89,12 +99,23 @@ impl ConfigPolicy {
         // an empty/dot path with globset is unreliable.
         let root_is_whitelisted = !user_blacklist.is_match(".") && !user_blacklist.is_match("");
 
+        let cwd = cwd.map(Path::to_path_buf);
+        let cwd_is_whitelisted = cwd
+            .as_ref()
+            .map(|p| {
+                !user_blacklist.is_match(p)
+                    && !user_blacklist.is_match(p.as_os_str().to_string_lossy().as_ref())
+            })
+            .unwrap_or(false);
+
         Ok(ConfigPolicy {
             root: root.to_path_buf(),
             blacklist: bl_builder.build()?,
             whitelist: wl_builder.build()?,
             disable_log: dl_builder.build()?,
             root_is_whitelisted,
+            cwd,
+            cwd_is_whitelisted,
         })
     }
 
@@ -131,6 +152,14 @@ impl Policy for ConfigPolicy {
             return AccessMode::Passthrough;
         }
 
+        if self.cwd_is_whitelisted {
+            if let Some(cwd) = &self.cwd {
+                if path == cwd || path.starts_with(cwd) {
+                    return AccessMode::Passthrough;
+                }
+            }
+        }
+
         AccessMode::CopyOnWrite
     }
 
@@ -150,11 +179,71 @@ impl Policy for ConfigPolicy {
         if under_root && self.root_is_whitelisted {
             return false;
         }
+        // Never log implicit current-working-directory passthrough.
+        if self.cwd_is_whitelisted {
+            if let Some(cwd) = &self.cwd {
+                if path == cwd || path.starts_with(cwd) {
+                    return false;
+                }
+            }
+        }
         // Never log paths where logging is explicitly disabled.
         if self.disable_log.is_match(rel) {
             return false;
         }
         // Remaining paths are CopyOnWrite outside the project root → log them.
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConfigPolicy;
+    use crate::config::config::Config;
+    use crate::fuse::policy::{AccessMode, Policy};
+    use std::path::Path;
+
+    fn empty_config() -> Config {
+        Config {
+            whitelist: Vec::new(),
+            blacklist: Vec::new(),
+            disable_log: Vec::new(),
+            log_level: None,
+            log: None,
+        }
+    }
+
+    #[test]
+    fn implicit_cwd_is_passthrough() {
+        let cfg = empty_config();
+        let root = Path::new("/project/eason/cas");
+        let cwd = Path::new("/home/eason/.cargo");
+        let policy = ConfigPolicy::from_config(&cfg, root, Some(cwd)).expect("policy");
+
+        assert_eq!(
+            policy.classify(Path::new("/home/eason/.cargo")),
+            AccessMode::Passthrough
+        );
+        assert_eq!(
+            policy.classify(Path::new("/home/eason/.cargo/registry/index")),
+            AccessMode::Passthrough
+        );
+        assert!(!policy.should_log(Path::new("/home/eason/.cargo/registry/index")));
+    }
+
+    #[test]
+    fn blacklist_still_wins_over_implicit_cwd() {
+        let mut cfg = empty_config();
+        cfg.blacklist = vec!["/home/eason/.cargo/**".to_string()];
+
+        let root = Path::new("/project/eason/cas");
+        let cwd = Path::new("/home/eason/.cargo");
+        let policy = ConfigPolicy::from_config(&cfg, root, Some(cwd)).expect("policy");
+
+        assert_eq!(
+            policy.classify(Path::new("/home/eason/.cargo/registry/index")),
+            AccessMode::FuseOnly
+        );
+        assert!(!policy.should_log(Path::new("/home/eason/.cargo/registry/index")));
     }
 }

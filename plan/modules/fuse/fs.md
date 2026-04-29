@@ -55,7 +55,25 @@ including:
 - whiteout masking
 - `Passthrough` collision `DontCare` classification
 
+## export support path resolution
+
+When `FUSE_EXPORT_SUPPORT` is enabled, `lookup` must resolve special components
+consistently:
+
+- `.` resolves to the current directory path
+- `..` resolves to the parent directory path
+
+This keeps export-style lookups aligned with kernel expectations.
+
 ## Flush/release/fsync
 
 - flush backing file (`sync_data`)
 - metadata can be updated via daemon `PutFileMeta` where needed
+
+## SQLite sidecar handling
+
+- SQLite rollback-journal files must not bypass FUSE lock/fsync semantics.
+- First write-capable open of an existing sqlite DB must copy-up the real file
+  contents before publishing the object entry.
+- Rollback journal creation/deletion must remain on the normal FUSE path so
+  lock ordering and `fsyncdir` behavior match sqlite expectations.

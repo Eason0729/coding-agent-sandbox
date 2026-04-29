@@ -68,7 +68,7 @@ pub fn cmd_clean(project_root: &Path, force: bool) -> Result<(), CleanError> {
         println!("Removed {}", data_dir.display());
     }
 
-    if let Ok((meta, _)) = meta_result {
+    if let Ok((meta, _, _)) = meta_result {
         if !meta.shm_name.is_empty() {
             if let Ok(shm) = crate::shm::ShmState::open(&meta.shm_name) {
                 drop(shm);

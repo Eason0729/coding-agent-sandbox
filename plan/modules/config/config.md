@@ -30,5 +30,6 @@ log = "./.sandbox/cas.log"
 
 ## Note
 - implicitly add pwd to whitelist(If pwd does not match blacklist)
+- implicitly add current working directory to whitelist(If it does not match blacklist)
 - implicitly add .sandbox to blocklist(If it does not match whitelist)
 - config and AccessMode are different(very important!), path are not automatically AccessMode::Passthrough when blacklist

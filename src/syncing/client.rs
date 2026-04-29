@@ -60,6 +60,19 @@ impl SyncClient {
         }
     }
 
+    pub fn ensure_file_object_from_real(
+        &mut self,
+        path: PathBuf,
+        meta: FileMetadata,
+    ) -> Result<(u64, PathBuf), ClientError> {
+        let response = self.send_request(Request::EnsureFileObjectFromReal { path, meta })?;
+        match response {
+            Response::EnsureFileObject { id, path } => Ok((id, path)),
+            Response::Error(msg) => Err(ClientError::Server(msg)),
+            _ => Err(ClientError::Server("Unexpected response".to_string())),
+        }
+    }
+
     pub fn get_object_path(&mut self, id: u64) -> Result<PathBuf, ClientError> {
         // todo: infer object path without hitting unix socket
         let response = self.send_request(Request::GetObjectPath { id })?;

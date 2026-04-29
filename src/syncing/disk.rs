@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::syncing::closure::PathTree;
 use crate::syncing::proto::FuseEntry;
 
 const SUPPORTED_ABI_VERSION: u32 = 3;
@@ -34,6 +35,18 @@ pub struct FuseMap {
     pub entries: HashMap<PathBuf, FuseEntry>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Default)]
+struct SyncState {
+    fuse_map: FuseMap,
+    tree: PathTree,
+}
+
+#[derive(Serialize)]
+struct SyncStateRef<'a> {
+    fuse_map: &'a FuseMap,
+    tree: &'a PathTree,
+}
+
 pub struct AccessLog {
     file: File,
 }
@@ -59,7 +72,7 @@ impl AccessLog {
     }
 }
 
-pub fn load(sandbox_dir: &PathBuf) -> Result<(SandboxMeta, FuseMap), DiskError> {
+pub fn load(sandbox_dir: &PathBuf) -> Result<(SandboxMeta, FuseMap, PathTree), DiskError> {
     let meta_path = sandbox_dir
         .join(".sandbox")
         .join("data")
@@ -86,22 +99,29 @@ pub fn load(sandbox_dir: &PathBuf) -> Result<(SandboxMeta, FuseMap), DiskError> 
         }
     };
 
-    let fuse_map = if map_path.exists() {
+    let (fuse_map, tree) = if map_path.exists() {
         let mut file = File::open(&map_path)?;
         let mut data = Vec::new();
         file.read_to_end(&mut data)?;
-        postcard::from_bytes(&data)?
+        if let Ok(state) = postcard::from_bytes::<SyncState>(&data) {
+            (state.fuse_map, state.tree)
+        } else {
+            let fuse_map: FuseMap = postcard::from_bytes(&data)?;
+            let tree = PathTree::from_paths(fuse_map.entries.keys());
+            (fuse_map, tree)
+        }
     } else {
-        FuseMap::default()
+        (FuseMap::default(), PathTree::default())
     };
 
-    Ok((meta, fuse_map))
+    Ok((meta, fuse_map, tree))
 }
 
 pub fn flush(
     sandbox_dir: &PathBuf,
     meta: &SandboxMeta,
     fuse_map: &FuseMap,
+    tree: &PathTree,
 ) -> Result<(), DiskError> {
     let meta_path = sandbox_dir
         .join(".sandbox")
@@ -114,7 +134,7 @@ pub fn flush(
     meta_file.write_all(&meta_data)?;
     meta_file.sync_all()?;
 
-    let map_data = postcard::to_allocvec(fuse_map)?;
+    let map_data = postcard::to_allocvec(&SyncStateRef { fuse_map, tree })?;
     let mut map_file = File::create(&map_path)?;
     map_file.write_all(&map_data)?;
     map_file.sync_all()?;
@@ -139,7 +159,7 @@ pub fn init_sandbox(sandbox_dir: &PathBuf, shm_name: &str) -> Result<(), DiskErr
         next_id: 1,
     };
     let fuse_map = FuseMap::default();
-    flush(sandbox_dir, &meta, &fuse_map)?;
+    flush(sandbox_dir, &meta, &fuse_map, &PathTree::default())?;
 
     Ok(())
 }
@@ -187,7 +207,7 @@ mod tests {
 
         let result = load(&dir);
         assert!(result.is_ok());
-        let (meta, _) = result.unwrap();
+        let (meta, _, _) = result.unwrap();
         assert_eq!(meta.abi_version, 3);
     }
 }

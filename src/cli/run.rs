@@ -141,7 +141,7 @@ fn prepare_context(project_root: &Path) -> Result<RunContext> {
             .map_err(|e| RunError::Io(std::io::Error::other(e.to_string())))?;
     }
 
-    let (meta, _fuse_map) = crate::syncing::disk::load(&project_root.to_path_buf())?;
+    let (meta, _fuse_map, _path_tree) = crate::syncing::disk::load(&project_root.to_path_buf())?;
     let policy = build_policy(project_root, &sandbox_dir)?;
 
     let shm = match ShmState::open(&meta.shm_name) {
@@ -160,7 +160,8 @@ fn prepare_context(project_root: &Path) -> Result<RunContext> {
 fn build_policy(project_root: &Path, sandbox_dir: &Path) -> Result<Arc<dyn Policy>> {
     let config_path = sandbox_dir.join("config.toml");
     let config = Config::from_file(&config_path)?;
-    let policy = ConfigPolicy::from_config(&config, project_root)
+    let cwd = std::env::current_dir().ok();
+    let policy = ConfigPolicy::from_config(&config, project_root, cwd.as_deref())
         .map_err(|e| RunError::Policy(e.to_string()))?;
     Ok(Arc::new(policy))
 }

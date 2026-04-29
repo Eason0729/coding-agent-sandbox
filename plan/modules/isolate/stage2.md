@@ -47,7 +47,7 @@ Because FUSE is bind-mounted at `rootfs/`, all of `/bin`, `/usr`, `/lib`, the pr
 
 1. Bind mount is allowed (ONLY) after creating user NS, because `CAP_SYS_ADMIN` is gained after that.
 2. `/proc` must be bind-mounted from the host (`MS_BIND | MS_REC`), not mounted fresh — a fresh `proc` mount requires owning a PID namespace, which we do not create.
-3. Device files must be bind-mounted one-by-one; the target files must be created (`std::fs::File::create`) before the bind mount since the kernel requires file-to-file bind mounts.
+3. Device files must be bind-mounted one-by-one; the target files must be created (`std::fs::File::create`) before the bind mount since the kernel requires file-to-file bind mounts, including `/dev/tty` when PTY mode is enabled.
 4. The FUSE bind mount uses `MS_BIND` (no `MS_NOEXEC` — executables must run from it).
 5. After `chroot`, `chdir` to the original working directory — it is accessible through FUSE passthrough.
 6. The sandbox PTY slave path is bind-mounted as `/dev/tty` only when PTY mode is enabled. The final sandbox process does `setsid()`, opens `/dev/tty` inside the chroot, issues `ioctl(TIOCSCTTY)`, and then `dup2()` to stdin/stdout/stderr before `exec`. The parent relay is responsible for putting the host terminal into raw mode while forwarding input, stripping OSC palette replies before forwarding them, flushing buffered input on teardown, and propagating window size changes via `SIGWINCH` + `TIOCSWINSZ`.

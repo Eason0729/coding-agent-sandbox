@@ -121,6 +121,7 @@ src/
 
 > `.sandbox` is implicitly added to the **HideReal** list (unless presented in whitelist config).
 > `$(pwd)` (the project root) is implicitly added to the **whitelist** (passthrough), unless presented in the blocklist config.
+> The sandbox process current working directory is also implicitly added to the **whitelist** (passthrough), unless presented in the blocklist config.
 
 The FUSE filesystem is rooted at `/` — it presents the **entire host filesystem** to the sandboxed process. Policy rules decide what happens at each path:
 

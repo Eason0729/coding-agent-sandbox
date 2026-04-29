@@ -58,6 +58,8 @@ pub fn prepare_chroot(
     std::fs::create_dir_all(rootfs.join("proc"))
         .map_err(|e| Stage2Error::MountIo(e.to_string()))?;
     std::fs::create_dir_all(rootfs.join("dev")).map_err(|e| Stage2Error::MountIo(e.to_string()))?;
+
+    // tty is created later by passing fds, so the tty is a slave of parent tty
     for dev in ["null", "zero", "random", "urandom"] {
         std::fs::File::create(rootfs.join("dev").join(dev))
             .map_err(|e| Stage2Error::MountIo(e.to_string()))?;

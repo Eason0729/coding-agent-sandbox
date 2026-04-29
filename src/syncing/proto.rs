@@ -34,6 +34,10 @@ pub enum Request {
         path: PathBuf,
         meta: FileMetadata,
     },
+    EnsureFileObjectFromReal {
+        path: PathBuf,
+        meta: FileMetadata,
+    },
     GetObjectPath {
         id: u64,
     },

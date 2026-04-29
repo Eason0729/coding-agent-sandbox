@@ -1,5 +1,6 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -51,6 +52,29 @@ impl ObjectStore {
 
     pub fn alloc_empty(&self) -> Result<u64, ObjectError> {
         self.put(&[])
+    }
+
+    pub fn put_copy_from(&self, source: &Path) -> Result<u64, ObjectError> {
+        let id = self.next_id.fetch_add(1, Ordering::AcqRel);
+        let path = self.object_path(id);
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let copy_result = (|| -> Result<(), std::io::Error> {
+            fs::copy(source, &path)?;
+            let file = File::open(&path)?;
+            file.sync_all()?;
+            Ok(())
+        })();
+
+        if let Err(err) = copy_result {
+            let _ = fs::remove_file(&path);
+            return Err(ObjectError::Io(err));
+        }
+
+        Ok(id)
     }
 
     pub fn path_for(&self, id: u64) -> PathBuf {
@@ -152,5 +176,21 @@ mod tests {
             store.object_path(0x0001_00ff),
             tmp.path().join("ff").join("00000000000100ff")
         );
+    }
+
+    #[test]
+    fn put_copy_from_copies_source_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        ObjectStore::init_dir(&dir).unwrap();
+
+        let store = ObjectStore::new(dir.clone(), 1);
+        let source = tmp.path().join("source.db");
+        fs::write(&source, b"SQLite format 3\0payload").unwrap();
+
+        let id = store.put_copy_from(&source).unwrap();
+        let copied = fs::read(store.path_for(id)).unwrap();
+
+        assert_eq!(copied, b"SQLite format 3\0payload");
     }
 }

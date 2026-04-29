@@ -15,6 +15,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::runtime::Runtime;
 use tokio::time::{sleep, Duration};
 
+use crate::syncing::closure::PathTree;
 use crate::syncing::disk::{self, FuseMap, SandboxMeta};
 use crate::syncing::object::ObjectStore;
 use crate::syncing::proto::{EntryType, FuseEntry, Request, Response};
@@ -24,6 +25,7 @@ const READY_TIMEOUT: Duration = Duration::from_secs(15);
 pub struct ServerState {
     pub objects: Arc<ObjectStore>,
     pub fuse_map: DashMap<PathBuf, crate::syncing::proto::FuseEntry>,
+    pub path_tree: PathTree,
     pub sandbox_dir: PathBuf,
     pub shm_name: String,
     pub abi_version: u32,
@@ -110,8 +112,31 @@ fn snapshot_state(state: &ServerState) -> (SandboxMeta, FuseMap) {
     (meta, fuse_map)
 }
 
+fn upsert_tree(state: &ServerState, path: &Path) {
+    state.path_tree.insert(path);
+}
+
+fn delete_tree(state: &ServerState, path: &Path) {
+    let _ = state.path_tree.remove(path);
+}
+
+fn rename_tree(state: &ServerState, from: &Path, to: &Path) {
+    let subtree = state.path_tree.subtree_paths(from);
+    let _ = state.path_tree.remove(from);
+
+    for old_path in subtree {
+        let rel = old_path.strip_prefix(from).unwrap_or(Path::new(""));
+        let mut new_path = to.to_path_buf();
+        if !rel.as_os_str().is_empty() {
+            new_path.push(rel);
+        }
+        state.path_tree.insert(&new_path);
+    }
+}
+
 fn build_server_state(sandbox_dir: &Path) -> std::result::Result<Arc<ServerState>, String> {
-    let (meta, fuse_map) = disk::load(&sandbox_dir.to_path_buf()).map_err(|e| e.to_string())?;
+    let (meta, fuse_map, path_tree) =
+        disk::load(&sandbox_dir.to_path_buf()).map_err(|e| e.to_string())?;
 
     let objects_dir = sandbox_dir.join(".sandbox").join("data").join("objects");
     let object_store = ObjectStore::new(objects_dir, meta.next_id);
@@ -119,6 +144,7 @@ fn build_server_state(sandbox_dir: &Path) -> std::result::Result<Arc<ServerState
     Ok(Arc::new(ServerState {
         objects: Arc::new(object_store),
         fuse_map: DashMap::from_iter(fuse_map.entries),
+        path_tree,
         sandbox_dir: sandbox_dir.to_path_buf(),
         shm_name: meta.shm_name,
         abi_version: meta.abi_version,
@@ -156,7 +182,7 @@ fn bind_listener_async(sock_path: &Path) -> std::io::Result<UnixListener> {
 
 fn flush_and_remove_socket(state: &ServerState, sock_path: &Path) {
     let (meta, fuse_map) = snapshot_state(state);
-    if let Err(e) = disk::flush(&state.sandbox_dir, &meta, &fuse_map) {
+    if let Err(e) = disk::flush(&state.sandbox_dir, &meta, &fuse_map, &state.path_tree) {
         log::error!("sync.lifecycle event=flush_failed error={e}");
     }
     let _ = std::fs::remove_file(sock_path);
@@ -291,7 +317,8 @@ async fn dispatch(state: &ServerState, request: Request) -> Response {
                         object_id: Some(id),
                         symlink_target: None,
                     };
-                    state.fuse_map.insert(path, new_entry);
+                    state.fuse_map.insert(path.clone(), new_entry);
+                    upsert_tree(state, &path);
                     Response::EnsureFileObject {
                         id,
                         path: object_path,
@@ -306,7 +333,51 @@ async fn dispatch(state: &ServerState, request: Request) -> Response {
                             object_id: Some(id),
                             symlink_target: None,
                         };
-                        state.fuse_map.insert(path, entry);
+                        state.fuse_map.insert(path.clone(), entry);
+                        upsert_tree(state, &path);
+                        Response::EnsureFileObject {
+                            id,
+                            path: object_path,
+                        }
+                    }
+                    Err(e) => Response::error(e.to_string()),
+                },
+            }
+        }
+        Request::EnsureFileObjectFromReal { path, meta } => {
+            let existing = state.fuse_map.get(&path).map(|v| v.clone());
+            match existing {
+                Some(entry)
+                    if entry.entry_type == EntryType::File
+                        && entry.object_id.is_some()
+                        && entry.symlink_target.is_none() =>
+                {
+                    let id = entry.object_id.unwrap_or_default();
+                    let object_path = state.objects.path_for(id);
+                    let new_entry = FuseEntry {
+                        entry_type: EntryType::File,
+                        metadata: meta,
+                        object_id: Some(id),
+                        symlink_target: None,
+                    };
+                    state.fuse_map.insert(path.clone(), new_entry);
+                    upsert_tree(state, &path);
+                    Response::EnsureFileObject {
+                        id,
+                        path: object_path,
+                    }
+                }
+                _ => match state.objects.put_copy_from(&path) {
+                    Ok(id) => {
+                        let object_path = state.objects.path_for(id);
+                        let entry = FuseEntry {
+                            entry_type: EntryType::File,
+                            metadata: meta,
+                            object_id: Some(id),
+                            symlink_target: None,
+                        };
+                        state.fuse_map.insert(path.clone(), entry);
+                        upsert_tree(state, &path);
                         Response::EnsureFileObject {
                             id,
                             path: object_path,
@@ -336,7 +407,8 @@ async fn dispatch(state: &ServerState, request: Request) -> Response {
                 object_id: Some(object_id),
                 symlink_target: None,
             };
-            state.fuse_map.insert(path, entry);
+            state.fuse_map.insert(path.clone(), entry);
+            upsert_tree(state, &path);
             Response::UpsertFileEntry
         }
         Request::PutFileMeta { path, meta } => match state.fuse_map.get_mut(&path) {
@@ -356,11 +428,13 @@ async fn dispatch(state: &ServerState, request: Request) -> Response {
         }
         Request::DeleteFile { path } => {
             state.fuse_map.remove(&path);
+            delete_tree(state, &path);
             Response::DeleteFile
         }
         Request::RenameFile { from, to } => {
             if let Some((_, entry)) = state.fuse_map.remove(&from) {
-                state.fuse_map.insert(to, entry);
+                state.fuse_map.insert(to.clone(), entry);
+                rename_tree(state, &from, &to);
                 Response::RenameFile
             } else {
                 Response::error("Source path not found")
@@ -373,7 +447,8 @@ async fn dispatch(state: &ServerState, request: Request) -> Response {
                 object_id: None,
                 symlink_target: None,
             };
-            state.fuse_map.insert(path, entry);
+            state.fuse_map.insert(path.clone(), entry);
+            upsert_tree(state, &path);
             Response::PutDir
         }
         Request::PutSymlink { path, target, meta } => {
@@ -383,7 +458,8 @@ async fn dispatch(state: &ServerState, request: Request) -> Response {
                 object_id: None,
                 symlink_target: Some(target),
             };
-            state.fuse_map.insert(path, entry);
+            state.fuse_map.insert(path.clone(), entry);
+            upsert_tree(state, &path);
             Response::PutSymlink
         }
         Request::PutWhiteout { path } => {
@@ -401,7 +477,8 @@ async fn dispatch(state: &ServerState, request: Request) -> Response {
                 object_id: None,
                 symlink_target: None,
             };
-            state.fuse_map.insert(path, entry);
+            state.fuse_map.insert(path.clone(), entry);
+            upsert_tree(state, &path);
             Response::PutWhiteout
         }
         Request::DeleteWhiteout { path } => {
@@ -414,64 +491,40 @@ async fn dispatch(state: &ServerState, request: Request) -> Response {
             Response::DeleteWhiteout
         }
         Request::ReadDirAll { path } => {
-            let entries: Vec<_> = state
-                .fuse_map
-                .iter()
-                .filter(|kv| {
-                    let p = kv.key();
-                    p.parent() == Some(path.as_path())
-                        || (path == PathBuf::from("/")
-                            && p.parent().is_none()
-                            && !p.as_os_str().is_empty())
-                })
-                .map(|kv| (kv.key().clone(), kv.value().clone()))
-                .collect();
+            let mut entries = Vec::new();
+            for child in state.path_tree.children_of(&path) {
+                if let Some(entry) = state.fuse_map.get(&child) {
+                    entries.push((child, entry.clone()));
+                }
+            }
 
             Response::DirEntries(entries)
         }
         Request::ListWhiteoutUnder { path } => {
-            let prefix = if path == Path::new("/") {
-                PathBuf::from("/")
-            } else {
-                path.clone()
-            };
-            let whiteouts = state
-                .fuse_map
-                .iter()
-                .filter_map(|kv| {
-                    let p = kv.key();
-                    let is_descendant = p.starts_with(&prefix) && p != &prefix;
-                    if is_descendant && kv.value().entry_type == EntryType::Whiteout {
-                        Some(p.clone())
-                    } else {
-                        None
+            let mut whiteouts = Vec::new();
+            for descendant in state.path_tree.descendants_of(&path) {
+                if let Some(entry) = state.fuse_map.get(&descendant) {
+                    if entry.entry_type == EntryType::Whiteout {
+                        whiteouts.push(descendant);
                     }
-                })
-                .collect::<Vec<_>>();
+                }
+            }
             Response::WhiteoutPaths(whiteouts)
         }
         Request::RenameTree { from, to } => {
-            let entries = state
-                .fuse_map
-                .iter()
-                .filter_map(|kv| {
-                    if kv.key() == &from || kv.key().starts_with(&from) {
-                        Some((kv.key().clone(), kv.value().clone()))
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
+            let entries = state.path_tree.subtree_paths(&from);
 
-            for (old_path, entry) in entries {
-                state.fuse_map.remove(&old_path);
-                let rel = old_path.strip_prefix(&from).unwrap_or(Path::new(""));
-                let mut new_path = to.clone();
-                if !rel.as_os_str().is_empty() {
-                    new_path.push(rel);
+            for old_path in entries {
+                if let Some((_, entry)) = state.fuse_map.remove(&old_path) {
+                    let rel = old_path.strip_prefix(&from).unwrap_or(Path::new(""));
+                    let mut new_path = to.clone();
+                    if !rel.as_os_str().is_empty() {
+                        new_path.push(rel);
+                    }
+                    state.fuse_map.insert(new_path, entry);
                 }
-                state.fuse_map.insert(new_path, entry);
             }
+            rename_tree(state, &from, &to);
             Response::RenameTree
         }
         Request::LogAccess { .. } => Response::error("LogAccess is not implemented"),
@@ -489,7 +542,7 @@ async fn dispatch(state: &ServerState, request: Request) -> Response {
                     .collect::<HashMap<_, _>>(),
             };
 
-            if let Err(e) = disk::flush(&state.sandbox_dir, &meta, &fuse_map) {
+            if let Err(e) = disk::flush(&state.sandbox_dir, &meta, &fuse_map, &state.path_tree) {
                 return Response::error(e.to_string());
             }
             Response::Flush
