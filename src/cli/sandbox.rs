@@ -194,41 +194,11 @@ fn run_setup_stage2(payload: SetupPayload, fuse_child: Pid) -> ! {
         std::process::exit(1);
     }
 
-    if let Err(e) = maybe_prepare_cargo_home(&payload.cmd_argv, &payload.cwd) {
-        log::error!("setup2 event=cargo_home_prepare_failed error={e}");
-        std::process::exit(1);
-    }
-
     if exec_command(&payload.cmd_argv, payload.pty_slave.is_some()).is_err() {
         std::process::exit(1);
     }
 
     std::process::exit(1);
-}
-
-fn is_cargo_like_command(program: &str) -> bool {
-    if program == "cargo" {
-        return true;
-    }
-    Path::new(program)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|n| n == "cargo")
-        .unwrap_or(false)
-}
-
-fn maybe_prepare_cargo_home(cmd_argv: &[String], cwd: &Path) -> Result<()> {
-    let Some(program) = cmd_argv.first() else {
-        return Ok(());
-    };
-    if !is_cargo_like_command(program) {
-        return Ok(());
-    }
-
-    let cargo_home = cwd.join(".cas-cargo-home");
-    std::fs::create_dir_all(&cargo_home).map_err(RunError::Io)?;
-    std::env::set_var("CARGO_HOME", &cargo_home);
-    Ok(())
 }
 
 fn exec_command(argv: &[String], use_pty: bool) -> Result<()> {
@@ -522,16 +492,4 @@ fn write_all_fd(fd: i32, mut data: &[u8]) -> Result<()> {
         data = &data[written..];
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_cargo_like_command;
-
-    #[test]
-    fn detects_cargo_binary_name() {
-        assert!(is_cargo_like_command("cargo"));
-        assert!(is_cargo_like_command("/home/me/.cargo/bin/cargo"));
-        assert!(!is_cargo_like_command("/usr/bin/rustc"));
-    }
 }

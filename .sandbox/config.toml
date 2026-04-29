@@ -1,4 +1,4 @@
-whitelist = []
+whitelist = ["~/.cargo/**"]
 blacklist = []
 disableLog = []
 logLevel = "debug"

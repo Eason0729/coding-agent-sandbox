@@ -1,9 +1,30 @@
+use std::env;
 use std::path::{Path, PathBuf};
 
 use globset::{Error as GlobError, Glob, GlobSet, GlobSetBuilder};
 
 use crate::config::config::Config;
 use crate::fuse::policy::{AccessMode, Policy};
+
+fn expand_path(pat: &str) -> String {
+    if pat.starts_with("~/") {
+        if let Some(home) = env::var_os("HOME") {
+            let mut expanded = PathBuf::from(home);
+            expanded.push(&pat[2..]);
+            return expanded.to_string_lossy().into_owned();
+        }
+    }
+    pat.to_string()
+}
+
+fn build_globset(patterns: &[String]) -> Result<GlobSet, GlobError> {
+    let mut builder = GlobSetBuilder::new();
+    for pat in patterns {
+        let expanded = expand_path(pat);
+        builder.add(Glob::new(&expanded)?);
+    }
+    builder.build()
+}
 
 /// Concrete [`Policy`] implementation driven by a parsed [`Config`].
 ///
@@ -45,18 +66,11 @@ pub struct ConfigPolicy {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn build_globset(patterns: &[String]) -> Result<GlobSet, GlobError> {
-    let mut builder = GlobSetBuilder::new();
-    for pat in patterns {
-        builder.add(Glob::new(pat)?);
-    }
-    builder.build()
-}
-
 fn build_globset_builder(patterns: &[String]) -> Result<GlobSetBuilder, GlobError> {
     let mut builder = GlobSetBuilder::new();
     for pat in patterns {
-        builder.add(Glob::new(pat)?);
+        let expanded = expand_path(pat);
+        builder.add(Glob::new(&expanded)?);
     }
     Ok(builder)
 }
@@ -201,6 +215,7 @@ mod tests {
     use super::ConfigPolicy;
     use crate::config::config::Config;
     use crate::fuse::policy::{AccessMode, Policy};
+    use std::env;
     use std::path::Path;
 
     fn empty_config() -> Config {
